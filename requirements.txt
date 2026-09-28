@@ -4,3 +4,4 @@ pyobjc-framework-ApplicationServices==12.1
 pyobjc-framework-Cocoa==12.1
 pyobjc-framework-Quartz==12.1
 pyinstaller==6.20.0
+dmgbuild==1.6.7
