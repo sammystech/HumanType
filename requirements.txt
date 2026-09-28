@@ -1,0 +1,6 @@
+pynput==1.8.2
+pyobjc-core==12.1
+pyobjc-framework-ApplicationServices==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-Quartz==12.1
+pyinstaller==6.20.0
