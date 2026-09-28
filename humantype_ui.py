@@ -77,8 +77,11 @@ from AppKit import (
     NSWorkspace,
 )
 from Foundation import (
+    NSActivityLatencyCritical,
+    NSActivityUserInitiated,
     NSMakePoint,
     NSObject,
+    NSProcessInfo,
     NSRunLoopCommonModes,
     NSThread,
     NSUserDefaults,
@@ -567,6 +570,7 @@ class AppController(NSObject):
         self.typist = None
         self._typing_gen = None     # active steps() generator while typing
         self._countdown_left = 0
+        self._activity = None       # App Nap opt-out held for a typing run
         self._monitor = None
         self._record_button = None  # button currently awaiting a key press
         self._record_which = None   # which binding is being recorded
@@ -1657,6 +1661,11 @@ rm -- "$0"   # self-delete
         self._done_steps  = 0
 
         self._set_running(True)
+        # While typing, HumanType sits hidden behind the app it types into,
+        # which is exactly when App Nap throttles timers; that would make the
+        # keystroke cadence lurch. Opt out for the length of the run.
+        self._activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+            NSActivityUserInitiated | NSActivityLatencyCritical, "Typing text")
         self._set_status(f"Click your target box — typing starts in {self._countdown_secs}s…")
         self.window.orderOut_(None)  # get out of the way so the target gets focus
         self._schedule(b"countdownTick:", 1.0)
@@ -1943,6 +1952,9 @@ rm -- "$0"   # self-delete
         self._cancel_typing_timers()
         self._typing_gen = None
         self.typist = None
+        if self._activity is not None:
+            NSProcessInfo.processInfo().endActivity_(self._activity)
+            self._activity = None
         # Leave the always-on tap running; just reset state.
         self.state = None
         # Reset permission flag so if Accessibility is later revoked the user

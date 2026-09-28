@@ -29,4 +29,6 @@ icon_locations = {
     os.path.basename(app): (180, 205),
     "Applications": (480, 205),
 }
-hide_extensions = [os.path.basename(app)]
+# No hide_extensions: it writes com.apple.FinderInfo onto the bundle, which
+# fails `codesign --verify --strict`, the check the in-app updater runs before
+# installing. (Finder hides ".app" by default anyway.)

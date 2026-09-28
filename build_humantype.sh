@@ -63,6 +63,16 @@ echo "==> Verifying the bundled binary (main-thread typing path)"
 echo "==> Building drag-to-install DMG"
 "$VENV/bin/python" tools/make_dmg_background.py
 "$VENV/bin/dmgbuild" -s dmg_settings.py -D app="$APP" "HumanType" "$DMG"
+# Run the in-app updater's own gate on the app inside the DMG: installed copies
+# refuse any update whose bundle fails this, so a DMG that fails it strands them.
+MNT=$(hdiutil attach "$DMG" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)
+if ! codesign --verify --deep --strict "$MNT/HumanType.app"; then
+  hdiutil detach "$MNT" -force -quiet
+  echo "!! The app inside $DMG fails strict signature verification; the updater would reject it."
+  exit 1
+fi
+hdiutil detach "$MNT" -quiet
+echo "    DMG passes the updater's signature check"
 
 if [ "${INSTALL:-1}" = 1 ]; then
   echo "==> Quitting any running copy"
