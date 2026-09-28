@@ -6,7 +6,15 @@
 # (humantype.py) and the AppKit UI (humantype_ui.py). pynput's macOS keyboard
 # backend is imported lazily, so we name it explicitly as a hidden import.
 
+import os
+import re
+
 from PyInstaller.utils.hooks import collect_submodules
+
+# APP_VERSION in humantype_ui.py is the single source of truth (release.sh
+# bumps it); the bundle's version strings are read from there.
+with open(os.path.join(SPECPATH, "humantype_ui.py"), encoding="utf-8") as fh:
+    VERSION = re.search(r'^APP_VERSION = "([^"]+)"', fh.read(), re.M).group(1)
 
 hiddenimports = (
     collect_submodules("pynput")
@@ -56,7 +64,10 @@ app = BUNDLE(
     info_plist={
         "LSUIElement": True,            # menu-bar only, no Dock icon
         "NSHighResolutionCapable": True,
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
+        # The bundled Python framework is built for macOS 26; say so up front
+        # instead of crashing on launch on anything older.
+        "LSMinimumSystemVersion": "26.0",
     },
 )

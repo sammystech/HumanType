@@ -1,52 +1,71 @@
 #!/usr/bin/env python3
 """Native macOS menu-bar UI for HumanType.
 
-A small AppKit app: lives in the menu bar, opens a modern window with a paste
-box, a speed picker, a "natural typos" toggle, Start / Pause-Resume / Stop / End
-buttons, and two click-to-record keybind fields (pause/resume and stop). All the
-typing logic lives in humantype.py; this file is just the interface."""
+A small AppKit app: lives in the menu bar, opens a Liquid Glass window with a
+paste box, a speed slider, a realism picker, Start / Pause-Resume / Stop / Quit
+buttons, snippets, and click-to-record global shortcuts. All the typing logic
+lives in humantype.py; this file is just the interface.
+
+The look is built from the real macOS 26+ glass material (NSGlassEffectView and
+glass-bezel buttons) floating over a slowly drifting colour field, because glass
+only reads as glass when there is something behind it to refract. AppKit gives
+an app the new design only when its main executable links the macOS 26+ SDK;
+build_humantype.sh checks that for the bundle."""
 
 import json
 import os
 import sys
 import threading
+import urllib.error
 import urllib.request
 import urllib.parse
 
 import objc
 from AppKit import (
+    NSAnimationContext,
+    NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
     NSButton,
     NSColor,
+    NSControlSizeLarge,
+    NSControlSizeRegular,
+    NSControlSizeSmall,
     NSEventMaskKeyDown,
     NSEventModifierFlagCommand,
     NSEventModifierFlagShift,
     NSEvent,
     NSFont,
+    NSFontWeightBold,
+    NSFontWeightMedium,
+    NSFontWeightRegular,
+    NSFontWeightSemibold,
     NSImage,
+    NSImageLeading,
+    NSImageOnly,
+    NSLineBreakByTruncatingTail,
     NSMakeRect,
     NSMakeSize,
     NSMenu,
     NSMenuItem,
     NSPasteboard,
     NSPasteboardTypeString,
-    NSPopUpButton,
     NSScrollView,
     NSSearchField,
     NSSegmentedControl,
     NSSlider,
     NSStatusBar,
+    NSSwitch,
+    NSTextAlignmentCenter,
+    NSTextAlignmentRight,
     NSTextField,
     NSTextView,
     NSVariableStatusItemLength,
     NSView,
-    NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectBlendingModeWithinWindow,
     NSVisualEffectMaterialMenu,
-    NSVisualEffectMaterialSidebar,
-    NSVisualEffectMaterialUnderWindowBackground,
     NSVisualEffectStateActive,
     NSVisualEffectView,
     NSWindow,
@@ -55,14 +74,20 @@ from AppKit import (
     NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskTitled,
     NSWindowTitleHidden,
+    NSWorkspace,
 )
 from Foundation import (
+    NSMakePoint,
     NSObject,
     NSRunLoopCommonModes,
     NSThread,
     NSUserDefaults,
+    NSValue,
 )
 from Quartz import (
+    CABasicAnimation,
+    CAGradientLayer,
+    CAMediaTimingFunction,
     CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource,
     CFRunLoopGetMain,
@@ -70,6 +95,7 @@ from Quartz import (
     CGEventMaskBit,
     CGEventTapCreate,
     CGEventTapEnable,
+    kCAMediaTimingFunctionEaseInEaseOut,
     kCGEventFlagMaskAlternate,
     kCGEventFlagMaskCommand,
     kCGEventFlagMaskControl,
@@ -91,10 +117,15 @@ from pynput.keyboard import Controller
 import humantype as ht
 
 # ---------------------------------------------------------------------------
-# App version + update endpoint
+# App version + updates
 # ---------------------------------------------------------------------------
-APP_VERSION  = "1.0.0"
-UPDATE_URL   = "https://YOUR-PROJECT.vercel.app/version.json"   # ← set after deploy
+APP_VERSION = "1.0.0"
+
+# Updates ship as GitHub Releases: release.sh bumps APP_VERSION, builds the DMG,
+# tags vX.Y.Z and attaches the DMG. Every installed copy polls the latest one.
+GITHUB_REPO     = "sammystech/HumanType"
+UPDATE_URL      = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_INTERVAL = 6 * 3600   # re-check while running; menu-bar apps run for days
 
 
 def _version_tuple(v):
@@ -105,11 +136,213 @@ def _version_tuple(v):
         return (0, 0, 0)
 
 
+def fetch_latest_release():
+    """The newest GitHub release as {"version", "download_url", "release_notes"},
+    or None when there is no release (or it has no DMG attached)."""
+    req = urllib.request.Request(UPDATE_URL, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"HumanType/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:      # repo has no releases yet
+            return None
+        raise
+    dmg = next((a.get("browser_download_url") for a in data.get("assets", [])
+                if a.get("name", "").endswith(".dmg")), None)
+    if not dmg:
+        return None
+    return {"version": data.get("tag_name", "0.0.0").lstrip("v"),
+            "download_url": dmg,
+            "release_notes": (data.get("body") or "").strip()
+                             or "Improvements and bug fixes."}
+
+
 # ---------------------------------------------------------------------------
 # License system — replace VALIDATE_URL with your deployed Vercel URL.
 # ---------------------------------------------------------------------------
 VALIDATE_URL = "https://YOUR-PROJECT.vercel.app/api/validate"
 BUY_URL      = "https://YOUR_STRIPE_PAYMENT_LINK"
+
+# The activation gate only switches on once a real license server is deployed:
+# with the placeholder URL no key can ever validate, so nobody could get in.
+LICENSING_ENABLED = "YOUR-PROJECT" not in VALIDATE_URL
+
+
+# ---------------------------------------------------------------------------
+# Liquid Glass primitives
+# ---------------------------------------------------------------------------
+try:
+    GlassEffectView = objc.lookUpClass("NSGlassEffectView")                  # macOS 26+
+    GlassEffectContainerView = objc.lookUpClass("NSGlassEffectContainerView")
+except objc.nosuchclass_error:
+    GlassEffectView = GlassEffectContainerView = None
+HAS_GLASS = GlassEffectView is not None
+
+BEZEL_GLASS   = 16   # NSBezelStyleGlass
+BEZEL_ROUNDED = 1    # NSBezelStyleRounded: the pre-26 fallback
+TINT_PRIMARY  = 2    # NSTintProminencePrimary
+BORDER_CIRCLE = 3    # NSControlBorderShapeCircle
+
+
+def reduce_motion():
+    try:
+        return bool(NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion())
+    except Exception:
+        return False
+
+
+class ColorView(NSView):
+    """A layer-backed fill whose NSColor re-resolves on every light/dark switch
+    (a CGColor set once on a layer freezes at its creation-time appearance)."""
+
+    def wantsUpdateLayer(self):
+        return True
+
+    def updateLayer(self):
+        color = getattr(self, "_color", None)
+        if color is not None:
+            self.layer().setBackgroundColor_(color.CGColor())
+
+    def viewDidChangeEffectiveAppearance(self):
+        objc.super(ColorView, self).viewDidChangeEffectiveAppearance()
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def set_color(self, color):
+        self._color = color
+        self.setNeedsDisplay_(True)
+
+
+def color_view(rect, color, radius=0.0):
+    v = ColorView.alloc().initWithFrame_(rect)
+    v.setWantsLayer_(True)
+    v.layer().setCornerRadius_(radius)
+    v.set_color(color)
+    return v
+
+
+class FlippedView(NSView):
+    """Top-down coordinates, so a scrolling list starts at its first row."""
+
+    def isFlipped(self):
+        return True
+
+
+# (x, y as fractions of the view, diameter as a fraction of its width,
+#  colour, seconds for one drift leg)
+AURORA_BLOBS = (
+    (0.08, 0.88, 0.95, NSColor.systemBlueColor,   17.0),
+    (0.98, 0.60, 0.85, NSColor.systemPurpleColor, 23.0),
+    (0.30, 0.06, 0.80, NSColor.systemTealColor,   19.0),
+    (0.85, 0.02, 0.60, NSColor.systemPinkColor,   29.0),
+)
+
+
+class AuroraView(NSView):
+    """The ambient backdrop: soft colour fields drifting slowly behind the
+    glass, which is what gives the glass something to bend."""
+
+    def wantsUpdateLayer(self):
+        return True
+
+    def viewDidChangeEffectiveAppearance(self):
+        objc.super(AuroraView, self).viewDidChangeEffectiveAppearance()
+        self.setNeedsDisplay_(True)
+
+    def updateLayer(self):
+        dark = (self.effectiveAppearance().bestMatchFromAppearancesWithNames_(
+            [NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) == NSAppearanceNameDarkAqua)
+        self.layer().setBackgroundColor_(NSColor.windowBackgroundColor().CGColor())
+        alpha = 0.42 if dark else 0.30
+        for blob, color in getattr(self, "_blobs", ()):
+            blob.setColors_([color.colorWithAlphaComponent_(alpha).CGColor(),
+                             color.colorWithAlphaComponent_(0.0).CGColor()])
+
+
+def aurora_view(rect):
+    v = AuroraView.alloc().initWithFrame_(rect)
+    v.setWantsLayer_(True)
+    v.layer().setMasksToBounds_(True)
+    w, h = rect.size.width, rect.size.height
+    still = reduce_motion()
+    blobs = []
+    for i, (rx, ry, rd, color, secs) in enumerate(AURORA_BLOBS):
+        d = rd * w
+        blob = CAGradientLayer.layer()
+        blob.setType_("radial")
+        blob.setStartPoint_((0.5, 0.5))
+        blob.setEndPoint_((1.0, 1.0))
+        blob.setBounds_(((0, 0), (d, d)))
+        blob.setPosition_((rx * w, ry * h))
+        if not still:
+            drift = CABasicAnimation.animationWithKeyPath_("position")
+            drift.setFromValue_(NSValue.valueWithPoint_(NSMakePoint(rx * w, ry * h)))
+            drift.setToValue_(NSValue.valueWithPoint_(NSMakePoint(
+                rx * w + (0.16 if i % 2 else -0.16) * w, ry * h + 0.10 * h)))
+            drift.setDuration_(secs)
+            drift.setAutoreverses_(True)
+            drift.setRepeatCount_(1e9)
+            drift.setTimingFunction_(
+                CAMediaTimingFunction.functionWithName_(kCAMediaTimingFunctionEaseInEaseOut))
+            blob.addAnimation_forKey_(drift, "drift")
+        v.layer().addSublayer_(blob)
+        blobs.append((blob, color()))
+    v._blobs = blobs
+    v.setNeedsDisplay_(True)
+    return v
+
+
+def glass_panel(rect, radius=22.0, tint=None):
+    """A real Liquid Glass panel (NSGlassEffectView). Returns (panel, content):
+    add subviews to `content`, whose coordinates are local to the panel."""
+    content = NSView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, rect.size.width, rect.size.height))
+    if HAS_GLASS:
+        panel = GlassEffectView.alloc().initWithFrame_(rect)
+        panel.setCornerRadius_(radius)
+        if tint is not None:
+            panel.setTintColor_(tint)
+        panel.setContentView_(content)
+    else:  # pre-26: a frosted blur with the same geometry
+        panel = NSVisualEffectView.alloc().initWithFrame_(rect)
+        panel.setMaterial_(NSVisualEffectMaterialMenu)
+        panel.setBlendingMode_(NSVisualEffectBlendingModeWithinWindow)
+        panel.setState_(NSVisualEffectStateActive)
+        panel.setWantsLayer_(True)
+        panel.layer().setCornerRadius_(radius)
+        panel.layer().setMasksToBounds_(True)
+        panel.addSubview_(content)
+    return panel, content
+
+
+def glass_group(rect, spacing=12.0):
+    """NSGlassEffectContainerView: glass controls inside it render as one
+    material and melt into each other when close. Returns (group, content)."""
+    content = NSView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, rect.size.width, rect.size.height))
+    if not HAS_GLASS:
+        content.setFrame_(rect)
+        return content, content
+    group = GlassEffectContainerView.alloc().initWithFrame_(rect)
+    group.setSpacing_(spacing)
+    group.setContentView_(content)
+    return group, content
+
+
+def set_symbol(button, name, *, only=False, label=None):
+    """Put an SF Symbol on a button, leading its title (or alone)."""
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, label)
+    if img is None:
+        return
+    button.setImage_(img)
+    button.setImagePosition_(NSImageOnly if only else NSImageLeading)
+    button.setImageHugsTitle_(True)
+
+
+def _typo_label(rate):
+    return f"{rate * 100:.0f}%" if rate > 0.0005 else "Preset"
 
 
 class LicenseManager:
@@ -172,58 +405,64 @@ class LicenseWindowController(NSObject):
 
     @objc.python_method
     def _build(self):
-        from AppKit import (NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
-                            NSWindowStyleMaskMiniaturizable, NSSecureTextField)
-        W2, H2 = 480, 320
-        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+        W2, H2 = 440, 340
+        style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                 | NSWindowStyleMaskFullSizeContentView)
         self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W2, H2), style, NSBackingStoreBuffered, False)
         self.window.setTitle_("Activate HumanType")
+        self.window.setTitlebarAppearsTransparent_(True)
+        self.window.setTitleVisibility_(NSWindowTitleHidden)
+        self.window.setMovableByWindowBackground_(True)
         self.window.setReleasedWhenClosed_(False)
 
-        # Glass background
-        bg = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W2, H2))
-        bg.setMaterial_(NSVisualEffectMaterialUnderWindowBackground)
-        bg.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        bg.setState_(NSVisualEffectStateActive)
-        self.window.setContentView_(bg)
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W2, H2))
+        root.addSubview_(aurora_view(root.bounds()))
+        self.window.setContentView_(root)
+        cw, ch = W2 - 40, H2 - 64
+        card, c = glass_panel(NSMakeRect(20, 20, cw, ch), radius=26)
+        root.addSubview_(card)
 
         def lbl(text, x, y, w, h, bold=False, size=13, gray=False):
             f = NSTextField.labelWithString_(text)
             f.setFrame_(NSMakeRect(x, y, w, h))
-            f.setFont_(NSFont.boldSystemFontOfSize_(size) if bold
-                       else NSFont.systemFontOfSize_(size))
+            f.setFont_(NSFont.systemFontOfSize_weight_(
+                size, NSFontWeightBold if bold else NSFontWeightRegular))
             if gray:
                 f.setTextColor_(NSColor.secondaryLabelColor())
             return f
 
-        bg.addSubview_(lbl("Activate HumanType", 24, H2-56, W2-48, 28, bold=True, size=20))
-        bg.addSubview_(lbl("Enter the license key from your purchase email.",
-                           24, H2-82, W2-48, 18, gray=True, size=12))
+        c.addSubview_(lbl("Activate HumanType", 22, ch - 50, cw - 44, 30, bold=True, size=22))
+        c.addSubview_(lbl("Enter the license key from your purchase email.",
+                          22, ch - 72, cw - 44, 18, gray=True, size=12))
 
-        bg.addSubview_(lbl("License Key", 24, 222, 120, 18, gray=True, size=11))
-        self.key_field = NSTextField.alloc().initWithFrame_(NSMakeRect(24, 194, W2-48, 28))
-        self.key_field.setFont_(NSFont.systemFontOfSize_(13))
+        c.addSubview_(lbl("License key", 22, 150, 120, 16, gray=True, size=11))
+        self.key_field = NSTextField.alloc().initWithFrame_(NSMakeRect(22, 114, cw - 44, 32))
+        self.key_field.setBezelStyle_(BEZEL_ROUNDED)   # NSTextFieldRoundedBezel
+        self.key_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(13, NSFontWeightRegular))
         self.key_field.setPlaceholderString_("HT-XXXXXXXX-XXXXXXXX-XXXXXXXX")
-        bg.addSubview_(self.key_field)
+        c.addSubview_(self.key_field)
 
-        # Activate button
         self.act_btn = NSButton.buttonWithTitle_target_action_(
-            "Activate", self, b"activate_:")
-        self.act_btn.setFrame_(NSMakeRect(24, 148, W2-48, 34))
+            "Activate", self, b"activate:")
+        self.act_btn.setFrame_(NSMakeRect(22, 64, cw - 44, 40))
+        self.act_btn.setControlSize_(NSControlSizeLarge)
+        self.act_btn.setFont_(NSFont.systemFontOfSize_weight_(14, NSFontWeightSemibold))
         self.act_btn.setBezelColor_(NSColor.controlAccentColor())
-        bg.addSubview_(self.act_btn)
+        if HAS_GLASS:
+            self.act_btn.setBezelStyle_(BEZEL_GLASS)
+            self.act_btn.setTintProminence_(TINT_PRIMARY)
+        c.addSubview_(self.act_btn)
 
-        # Buy button
         buy_btn = NSButton.buttonWithTitle_target_action_(
-            "Don't have a key? Buy HumanType — $14.99", self, b"buy_:")
-        buy_btn.setFrame_(NSMakeRect(24, 106, W2-48, 28))
-        buy_btn.setBezelStyle_(0)  # inline/link style
-        buy_btn.setButtonType_(0)
-        bg.addSubview_(buy_btn)
+            "Don't have a key? Buy HumanType — $14.99", self, b"buy:")
+        buy_btn.setFrame_(NSMakeRect(22, 34, cw - 44, 22))
+        buy_btn.setBordered_(False)
+        buy_btn.setContentTintColor_(NSColor.controlAccentColor())
+        c.addSubview_(buy_btn)
 
-        self.status_lbl = lbl("", 24, 68, W2-48, 28, gray=True, size=12)
-        bg.addSubview_(self.status_lbl)
+        self.status_lbl = lbl("", 22, 10, cw - 44, 18, gray=True, size=12)
+        c.addSubview_(self.status_lbl)
 
         # Pre-fill if a key was entered before
         saved = LicenseManager.stored_key()
@@ -256,7 +495,7 @@ class LicenseWindowController(NSObject):
         else:
             self.act_btn.setEnabled_(True)
             self.act_btn.setTitle_("Activate")
-            self.status_lbl.setStringValue_(f"❌  {info}")
+            self.status_lbl.setStringValue_(info)
 
     def buy_(self, sender):
         from AppKit import NSWorkspace
@@ -266,8 +505,16 @@ class LicenseWindowController(NSObject):
 
 
 # Window geometry.
-W, H, SB = 660, 600, 160   # total width, height, sidebar width
-M = 20                      # content margin inside panels
+W, H = 620, 680     # window size
+M = 24              # page margin
+TOP = H - 64        # top of the page area, just under the floating tab bar
+
+# (title, SF Symbol, page key, action) for the floating glass tab bar.
+TABS = (
+    ("Type",     "keyboard",         "type",     b"showTabType:"),
+    ("Snippets", "doc.on.clipboard", "snippets", b"showTabSnippets:"),
+    ("Settings", "gearshape",        "settings", b"showTabSettings:"),
+)
 
 SPEED_WPM = {"Slow": 35, "Normal": 55, "Fast": 80, "Extra Fast": 120}
 
@@ -286,7 +533,7 @@ KEYNAMES = {
     26: "7", 27: "-", 28: "8", 29: "0", 30: "]", 31: "O", 32: "U", 33: "[",
     34: "I", 35: "P", 36: "Return", 37: "L", 38: "J", 39: "'", 40: "K",
     41: ";", 42: "\\", 43: ",", 44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab",
-    49: "Space", 50: "`", 51: "Delete", 53: "Esc", 65: ".", 67: "*", 69: "+",
+    49: "Space", 50: "` (backtick)", 51: "Delete", 53: "Esc", 65: ".", 67: "*", 69: "+",
     75: "/", 76: "Enter", 78: "-", 123: "←", 124: "→", 125: "↓", 126: "↑",
 }
 
@@ -369,11 +616,12 @@ class AppController(NSObject):
         self._build_window()
         self._install_global_tap()
 
-        self._update_info = None   # filled by background update check
-        if LicenseManager.is_licensed():
+        self._update_info = None       # filled by background update check
+        self._skipped_version = None   # "Later" on this version: don't re-ask
+        # Check for updates quietly a few seconds after launch, then periodically.
+        self._schedule(b"_checkForUpdates:", 4.0)
+        if LicenseManager.is_licensed() or not LICENSING_ENABLED:
             self.showWindow_(None)
-            # Check for updates silently in the background after a short delay
-            self._schedule(b"_checkForUpdates:", 4.0)
         else:
             # Show activation screen; main window opens after successful activation.
             self._license_ctrl = LicenseWindowController.alloc().init()
@@ -389,74 +637,70 @@ class AppController(NSObject):
     def applicationShouldTerminateAfterLastWindowClosed_(self, sender):
         return False  # keep living in the menu bar after the window closes
 
-    # --- UI construction ----------------------------------------------------
-
-    @objc.python_method
-    # ── Auto-update system ────────────────────────────────────────────────
+    # ── Auto-update (GitHub Releases) ─────────────────────────────────────
 
     def _checkForUpdates_(self, _):
-        """Scheduled on the main run loop a few seconds after launch.
-        Spawns a background thread so the network call never blocks the UI."""
+        """Scheduled on the main run loop: shortly after launch, then every
+        UPDATE_INTERVAL. The network call runs on a background thread."""
         threading.Thread(target=self._fetch_update_info, daemon=True).start()
+        self._schedule(b"_checkForUpdates:", UPDATE_INTERVAL)
 
     @objc.python_method
     def _fetch_update_info(self):
-        """Background: fetch version.json and compare with APP_VERSION."""
-        if "YOUR-PROJECT" in UPDATE_URL or "YOUR_" in UPDATE_URL:
-            return  # placeholder URL — silently skip
+        """Background: fetch the latest release and compare with APP_VERSION."""
         try:
-            req = urllib.request.Request(
-                UPDATE_URL,
-                headers={"User-Agent": f"HumanType/{APP_VERSION}"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read())
-            remote = data.get("version", "0.0.0")
-            if _version_tuple(remote) > _version_tuple(APP_VERSION):
-                self._update_info = data
-                # Jump back to main thread to update UI
-                self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    b"_showUpdateBadge:", data, False)
+            info = fetch_latest_release()
         except Exception:
-            pass   # silent — no update badge if the check fails
+            return   # silent — the next scheduled check tries again
+        if info and _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
+            self._update_info = info
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"_offerUpdate:", info, False)
+
+    def _offerUpdate_(self, info):
+        """Main thread: badge the UI, then ask once per version — but never
+        mid-run, where a modal alert would take the keystrokes meant for the
+        target app. The menu-bar item stays available either way."""
+        self._showUpdateBadge_(info)
+        if info.get("version") == self._skipped_version or self._typing_gen is not None:
+            return
+        self._promptUpdate_(info)
 
     def _showUpdateBadge_(self, info):
-        """Main thread: show the update badge in the sidebar."""
+        """Main thread: point the version label and menu item at the update."""
         version = info.get("version", "?") if info else "?"
-        if hasattr(self, "_sidebar_status"):
-            self._sidebar_status.setStringValue_(
-                f"Update {version} available!")
-            self._sidebar_status.setTextColor_(NSColor.controlAccentColor())
+        if hasattr(self, "_version_lbl"):
+            self._version_lbl.setStringValue_(
+                f"HumanType {APP_VERSION} · version {version} is available")
+            self._version_lbl.setTextColor_(NSColor.controlAccentColor())
+        if getattr(self, "_update_menu_item", None) is not None:
+            self._update_menu_item.setTitle_(f"Install Update {version}…")
 
     def checkForUpdatesManually_(self, sender):
-        """Menu item action — force-checks for updates and tells the user."""
+        """Menu item — install a known update, or check now and report back."""
+        if self._update_info:
+            self._promptUpdate_(self._update_info)
+            return
         self._set_status("Checking for updates…")
         threading.Thread(target=self._check_manually_bg, daemon=True).start()
 
     @objc.python_method
     def _check_manually_bg(self):
-        if "YOUR-PROJECT" in UPDATE_URL or "YOUR_" in UPDATE_URL:
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_updateCheckFailed:",
-                "Update URL not configured — set UPDATE_URL in humantype_ui.py after deploying your backend.",
-                False)
-            return
         try:
-            req = urllib.request.Request(
-                UPDATE_URL,
-                headers={"User-Agent": f"HumanType/{APP_VERSION}"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read())
-            remote = data.get("version", "0.0.0")
-            if _version_tuple(remote) > _version_tuple(APP_VERSION):
-                self._update_info = data
-                self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    b"_promptUpdate:", data, False)
-            else:
-                self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    b"_noUpdateFound:", None, False)
+            info = fetch_latest_release()
         except Exception as e:
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 b"_updateCheckFailed:", str(e), False)
+            return
+        if info and _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
+            self._update_info = info
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"_showUpdateBadge:", info, False)
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"_promptUpdate:", info, False)
+        else:
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"_noUpdateFound:", None, False)
 
     def _promptUpdate_(self, info):
         from AppKit import NSAlert, NSAlertFirstButtonReturn
@@ -466,11 +710,14 @@ class AppController(NSObject):
         alert.setMessageText_(f"HumanType {version} is available")
         alert.setInformativeText_(
             f"You have {APP_VERSION}. What's new:\n\n{notes}\n\n"
-            "The update will download in the background and install automatically.")
+            "It downloads in the background, then HumanType reopens on the new version.")
         alert.addButtonWithTitle_("Download & Install")
         alert.addButtonWithTitle_("Later")
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         if alert.runModal() == NSAlertFirstButtonReturn:
             self._start_update_download(info)
+        else:
+            self._skipped_version = version
 
     def _noUpdateFound_(self, _):
         self._set_status(f"You're up to date (v{APP_VERSION}).")
@@ -482,7 +729,7 @@ class AppController(NSObject):
     def _start_update_download(self, info):
         url = info.get("download_url", "")
         if not url:
-            self._set_status("Update URL missing — check humantype-backend/public/version.json.")
+            self._set_status("That release has no DMG attached.")
             return
         self._set_status("Downloading update…")
         threading.Thread(target=self._download_update_bg,
@@ -511,23 +758,30 @@ class AppController(NSObject):
 
     def _installUpdate_(self, tmp_dmg):
         """Write a self-deleting shell shim that waits for this app to quit,
-        then mounts the DMG, copies the new .app, and relaunches."""
+        then mounts the DMG, swaps in the new .app, and relaunches."""
         from Foundation import NSBundle
         app_path = str(NSBundle.mainBundle().bundlePath())
+        # Copy beside the old bundle, then swap: ditto *over* the old bundle
+        # would merge, leaving stale files inside that break its signature.
         shim = f"""\
 #!/bin/bash
 # HumanType auto-updater shim — runs after the app quits
 while pgrep -f "HumanType.app/Contents/MacOS" > /dev/null 2>&1; do sleep 0.3; done
 sleep 0.5
-# Mount update DMG
 MNT=$(hdiutil attach "{tmp_dmg}" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)
 if [ -z "$MNT" ]; then exit 1; fi
-# Copy new app
-ditto "$MNT/HumanType.app" "{app_path}"
+NEW="$MNT/HumanType.app"
+APP="{app_path}"
+# Never replace a working app with a bundle whose signature doesn't verify.
+if codesign --verify --deep --strict "$NEW" 2>/dev/null; then
+    rm -rf "$APP.new"
+    ditto "$NEW" "$APP.new" && rm -rf "$APP" && mv "$APP.new" "$APP"
+fi
 hdiutil detach "$MNT" -force -quiet 2>/dev/null
-xattr -dr com.apple.quarantine "{app_path}" 2>/dev/null
+xattr -dr com.apple.quarantine "$APP" 2>/dev/null
+rm -f "{tmp_dmg}"
 sleep 0.5
-open "{app_path}"
+open "$APP"
 rm -- "$0"   # self-delete
 """
         shim_path = "/tmp/humantype_updater.sh"
@@ -542,6 +796,7 @@ rm -- "$0"   # self-delete
 
     # ── UI construction ───────────────────────────────────────────────────
 
+    @objc.python_method
     def _build_main_menu(self):
         """Accessory (menu-bar) apps have no main menu, so the standard editing
         key equivalents (⌘V/⌘C/⌘X/⌘A/⌘Z) are never delivered to the text view —
@@ -596,6 +851,7 @@ rm -- "$0"   # self-delete
             it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
             it.setTarget_(self)
             menu.addItem_(it)
+            return it
 
         item("Show HumanType", b"showWindow:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -626,24 +882,26 @@ rm -- "$0"   # self-delete
         self.lock_menu_item.setTarget_(self)
         menu.addItem_(self.lock_menu_item)
         menu.addItem_(NSMenuItem.separatorItem())
-        item("Enter License Key", b"showLicense:")
-        item("Check for Updates", b"checkForUpdatesManually:")
+        if LICENSING_ENABLED:
+            item("Enter License Key", b"showLicense:")
+        self._update_menu_item = item("Check for Updates", b"checkForUpdatesManually:")
         menu.addItem_(NSMenuItem.separatorItem())
         item("Quit & Reopen (apply permission)", b"relaunch:")
         item("Quit HumanType", b"end:")
         self.status_item.setMenu_(menu)
 
     # =========================================================================
-    # Generic UI primitives — liquid glass flavour
+    # Liquid Glass UI primitives
     # =========================================================================
 
     @objc.python_method
     def _label(self, text, rect, *, bold=False, size=13, gray=False,
-               dim=False, align=0, color=None):
+               dim=False, align=0, color=None, weight=None):
         lbl = NSTextField.labelWithString_(text)
         lbl.setFrame_(rect)
-        lbl.setFont_(NSFont.boldSystemFontOfSize_(size) if bold
-                     else NSFont.systemFontOfSize_(size))
+        if weight is None:
+            weight = NSFontWeightBold if bold else NSFontWeightRegular
+        lbl.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
         if color:
             lbl.setTextColor_(color)
         elif dim:
@@ -655,81 +913,57 @@ rm -- "$0"   # self-delete
         return lbl
 
     @objc.python_method
-    def _glass_card(self, rect, *, radius=16, alpha=0.10, border_alpha=0.20,
-                    sheen=True):
-        """A liquid-glass panel: within-window blur + white tint + sheen."""
-        # NSVisualEffectView provides the actual blur
-        v = NSVisualEffectView.alloc().initWithFrame_(rect)
-        v.setMaterial_(NSVisualEffectMaterialMenu)
-        v.setBlendingMode_(NSVisualEffectBlendingModeWithinWindow)
-        v.setState_(NSVisualEffectStateActive)
-        v.setWantsLayer_(True)
-        vl = v.layer()
-        vl.setCornerRadius_(radius)
-        vl.setMasksToBounds_(True)
-        vl.setBorderWidth_(0.75)
-        vl.setBorderColor_(
-            NSColor.colorWithWhite_alpha_(1.0, border_alpha).CGColor())
-        # White tint overlay for the "frosted" look
-        tint = NSView.alloc().initWithFrame_(v.bounds())
-        tint.setWantsLayer_(True)
-        tint.layer().setBackgroundColor_(
-            NSColor.colorWithWhite_alpha_(1.0, alpha).CGColor())
-        v.addSubview_(tint)
-        if sheen and rect.size.height > 30:
-            # Subtle highlight at the top edge (glass catches light)
-            sh_h = min(rect.size.height * 0.28, 32)
-            sheen_v = NSView.alloc().initWithFrame_(
-                NSMakeRect(0, rect.size.height - sh_h,
-                           rect.size.width, sh_h))
-            sheen_v.setWantsLayer_(True)
-            sheen_v.layer().setBackgroundColor_(
-                NSColor.colorWithWhite_alpha_(1.0, 0.10).CGColor())
-            v.addSubview_(sheen_v)
-        return v
-
-    @objc.python_method
-    def _pill_button(self, title, sel, rect, *,
-                     style="secondary",   # "primary" | "secondary" | "ghost"
-                     size=13):
-        """iOS 26-style pill button — rounded, glassy fill."""
+    def _glass_button(self, title, sel, rect, *, symbol=None, prominent=False,
+                      size=13, icon_only=False):
+        """A Liquid Glass capsule button (NSBezelStyleGlass). `prominent` tints
+        the glass with the accent colour, for the one primary action."""
         btn = NSButton.buttonWithTitle_target_action_(title, self, sel)
+        btn.setBezelStyle_(BEZEL_GLASS if HAS_GLASS else BEZEL_ROUNDED)
+        h = rect.size.height
+        btn.setControlSize_(NSControlSizeLarge if h >= 34
+                            else NSControlSizeRegular if h >= 26
+                            else NSControlSizeSmall)
         btn.setFrame_(rect)
-        btn.setBezelStyle_(0)
-        btn.setBordered_(False)
-        btn.setFont_(NSFont.systemFontOfSize_(size))
-        btn.setWantsLayer_(True)
-        l = btn.layer()
-        l.setCornerRadius_(rect.size.height / 2)
-        l.setMasksToBounds_(True)
-        if style == "primary":
-            l.setBackgroundColor_(NSColor.controlAccentColor().CGColor())
-            l.setBorderWidth_(0)
-            btn.setContentTintColor_(NSColor.whiteColor())
-        elif style == "secondary":
-            l.setBackgroundColor_(
-                NSColor.colorWithWhite_alpha_(1.0, 0.12).CGColor())
-            l.setBorderWidth_(0.75)
-            l.setBorderColor_(
-                NSColor.colorWithWhite_alpha_(1.0, 0.25).CGColor())
-        else:  # ghost
-            l.setBackgroundColor_(NSColor.clearColor().CGColor())
-            l.setBorderWidth_(0)
+        btn.setFont_(NSFont.systemFontOfSize_weight_(
+            size, NSFontWeightSemibold if prominent else NSFontWeightMedium))
+        if symbol:
+            set_symbol(btn, symbol, only=icon_only, label=title)
+        if icon_only:
+            btn.setToolTip_(title)
+            if HAS_GLASS:
+                btn.setBorderShape_(BORDER_CIRCLE)
+        if prominent:
+            btn.setBezelColor_(NSColor.controlAccentColor())
+            if HAS_GLASS:
+                btn.setTintProminence_(TINT_PRIMARY)
         return btn
 
     @objc.python_method
     def _button(self, title, sel, rect, *, accent=False):
-        """Compat wrapper used by auto-generated keybind rows."""
-        return self._pill_button(title, sel, rect,
-                                 style="primary" if accent else "secondary")
+        """Compat wrapper used by the shortcut rows."""
+        return self._glass_button(title, sel, rect, prominent=accent)
 
     @objc.python_method
     def _section_header(self, text, parent, x, y, w):
         lbl = NSTextField.labelWithString_(text.upper())
-        lbl.setFrame_(NSMakeRect(x, y, w, 13))
-        lbl.setFont_(NSFont.systemFontOfSize_(9.5))
-        lbl.setTextColor_(NSColor.tertiaryLabelColor())
+        lbl.setFrame_(NSMakeRect(x, y, w, 14))
+        lbl.setFont_(NSFont.systemFontOfSize_weight_(10.5, NSFontWeightSemibold))
+        lbl.setTextColor_(NSColor.secondaryLabelColor())
         parent.addSubview_(lbl)
+
+    @objc.python_method
+    def _separator(self, parent, x, y, w):
+        parent.addSubview_(color_view(NSMakeRect(x, y, w, 0.5),
+                                      NSColor.separatorColor()))
+
+    @objc.python_method
+    def _page_title(self, parent, title, subtitle):
+        """iOS-style large title under the tab bar."""
+        parent.addSubview_(self._label(
+            title, NSMakeRect(M, TOP - 40, 240, 36), size=28,
+            weight=NSFontWeightBold))
+        parent.addSubview_(self._label(
+            subtitle, NSMakeRect(M + 1, TOP - 60, W - 2*M, 18), size=12, gray=True))
 
     @objc.python_method
     def _add_slider(self, parent, rect, lo, hi, val, sel):
@@ -743,7 +977,7 @@ rm -- "$0"   # self-delete
         return sl
 
     # =========================================================================
-    # Window build — full liquid-glass redesign
+    # Window build
     # =========================================================================
 
     @objc.python_method
@@ -760,121 +994,89 @@ rm -- "$0"   # self-delete
         self.window.setMovableByWindowBackground_(True)
         self.window.center()
 
-        # ── Layer 0: full-window blur (blurs the desktop)
-        root = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
-        root.setMaterial_(NSVisualEffectMaterialUnderWindowBackground)
-        root.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        root.setState_(NSVisualEffectStateActive)
+        # Layer 0: the drifting colour field the glass refracts.
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+        root.addSubview_(aurora_view(root.bounds()))
         self.window.setContentView_(root)
 
-        # ── Sidebar ───────────────────────────────────────────────────────
-        sb_vfx = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, SB, H))
-        sb_vfx.setMaterial_(NSVisualEffectMaterialSidebar)
-        sb_vfx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
-        sb_vfx.setState_(NSVisualEffectStateActive)
-        sb_vfx.setWantsLayer_(True)
-        sb_l = sb_vfx.layer()
-        sb_l.setMasksToBounds_(True)
-        # Hair-line separator on the right edge
-        sep = NSView.alloc().initWithFrame_(NSMakeRect(SB - 0.5, 0, 0.5, H))
-        sep.setWantsLayer_(True)
-        sep.layer().setBackgroundColor_(
-            NSColor.colorWithWhite_alpha_(1.0, 0.12).CGColor())
-        sb_vfx.addSubview_(sep)
-        root.addSubview_(sb_vfx)
-        sidebar = sb_vfx
+        # Pages, then the floating tab bar above them.
+        self._tab_type = self._page(root)
+        self._build_type_page(self._tab_type)
+        self._tab_snippets = self._page(root)
+        self._build_snippets_page(self._tab_snippets)
+        self._tab_settings = self._page(root)
+        self._build_settings_panel(self._tab_settings)
+        self._build_tab_bar(root)
+        self._show_tab("type", animate=False)
 
-        # Logo mark
-        logo_size = 34
-        logo = NSView.alloc().initWithFrame_(
-            NSMakeRect(16, H - 58, logo_size, logo_size))
-        logo.setWantsLayer_(True)
-        ll = logo.layer()
-        ll.setCornerRadius_(10)
-        ll.setBackgroundColor_(NSColor.controlAccentColor().CGColor())
-        sidebar.addSubview_(logo)
-        lbl_logo = NSTextField.labelWithString_("HT")
-        lbl_logo.setFrame_(NSMakeRect(0, 8, logo_size, logo_size - 10))
-        lbl_logo.setAlignment_(1)
-        lbl_logo.setFont_(NSFont.boldSystemFontOfSize_(12))
-        lbl_logo.setTextColor_(NSColor.whiteColor())
-        logo.addSubview_(lbl_logo)
+    @objc.python_method
+    def _page(self, root):
+        v = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+        root.addSubview_(v)
+        return v
 
-        # App name
-        sidebar.addSubview_(self._label(
-            "HumanType",
-            NSMakeRect(16 + logo_size + 8, H - 48, SB - logo_size - 28, 18),
-            bold=True, size=14))
-        sidebar.addSubview_(self._label(
-            f"v{APP_VERSION}",
-            NSMakeRect(16 + logo_size + 8, H - 63, SB - logo_size - 28, 14),
-            size=10, gray=True))
-
-        # Nav items (iOS 26 pill style)
-        nav_items = [
-            ("⌨  Type",      "type",     b"showTabType:"),
-            ("☰  Snippets",  "snippets", b"showTabSnippets:"),
-            ("⚙  Settings",  "settings", b"showTabSettings:"),
-        ]
+    @objc.python_method
+    def _build_tab_bar(self, root):
+        """A floating glass capsule with a sliding selection lens: the iOS 26/27
+        tab bar, moved to the top of a Mac window."""
+        seg_w, seg_h, pad = 116, 34, 4
+        bar_w, bar_h = len(TABS) * seg_w + 2 * pad, seg_h + 2 * pad
+        bar, content = glass_panel(
+            NSMakeRect((W - bar_w) / 2, H - bar_h - 12, bar_w, bar_h),
+            radius=bar_h / 2)
+        self._tab_lens = color_view(
+            NSMakeRect(pad, pad, seg_w, seg_h),
+            NSColor.labelColor().colorWithAlphaComponent_(0.11), seg_h / 2)
+        content.addSubview_(self._tab_lens)
         self._nav_btns = {}
-        for i, (title, key, sel) in enumerate(nav_items):
-            y = H - 106 - i * 42
-            btn = self._pill_button(title, sel,
-                                    NSMakeRect(10, y, SB - 20, 34),
-                                    style="secondary", size=13)
-            sidebar.addSubview_(btn)
+        for i, (title, sym, key, sel) in enumerate(TABS):
+            btn = NSButton.buttonWithTitle_target_action_(title, self, sel)
+            btn.setBordered_(False)
+            btn.setFrame_(NSMakeRect(pad + i * seg_w, pad, seg_w, seg_h))
+            btn.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
+            set_symbol(btn, sym)
+            content.addSubview_(btn)
             self._nav_btns[key] = btn
+        root.addSubview_(bar)
 
-        # Update / status badge at bottom of sidebar
-        self._sidebar_status = self._label(
-            "", NSMakeRect(12, 14, SB - 24, 14), size=10, gray=True)
-        sidebar.addSubview_(self._sidebar_status)
+    # ── Type page ────────────────────────────────────────────────────────
 
-        # ── Content panels ────────────────────────────────────────────────
-        cx, cw = SB, W - SB
+    @objc.python_method
+    def _build_type_page(self, tp):
+        #  18  status + ETA
+        #  44  progress capsule           h=5
+        #  62  glass action group         h=44
+        # 122  speed / realism glass card h=96
+        # 230  stats + Save as Snippet
+        # 258  text card bottom … TOP-72 text card top
+        self._page_title(tp, "Type", "Paste text, click into your target, watch it type.")
+        self._lock_lbl = self._label(
+            "", NSMakeRect(M + 120, TOP - 32, W - 2*M - 120, 18), size=12,
+            weight=NSFontWeightSemibold, color=NSColor.systemOrangeColor(),
+            align=NSTextAlignmentRight)
+        tp.addSubview_(self._lock_lbl)
 
-        def panel():
-            v = NSView.alloc().initWithFrame_(NSMakeRect(cx, 0, cw, H))
-            v.setWantsLayer_(True)
-            return v
-
-        # ── TYPE TAB ─────────────────────────────────────────────────────
-        self._tab_type = panel()
-        root.addSubview_(self._tab_type)
-        tp = self._tab_type
-
-        # Floating title area
-        tp.addSubview_(self._label(
-            "Type", NSMakeRect(M, H - 44, 60, 26), bold=True, size=20))
-        tp.addSubview_(self._label(
-            "Paste text, click your target, watch it type.",
-            NSMakeRect(M + 66, H - 40, cw - M - 70, 16), size=11, gray=True))
-
-        # ── Clean layout from bottom (no cards around controls):
-        #  16  status + ETA      h=16
-        #  40  progress bar      h=4
-        #  52  buttons           h=36  → top 88
-        #  96  realism pills     h=26  → top 122  (3 minimal pill buttons)
-        # 130  speed row         h=20  → top 150  (label + slider + wpm, no container)
-        # 158  stats + snippet   h=14  → top 172
-        # 176  text card bottom
-        # 558  text card top     (H-42)
-
-        TT = H - 42          # 558 — taller text area
-        TB = 176             # text card bottom
-
-        # ── Large glass text area
-        text_card = self._glass_card(NSMakeRect(M, TB, cw - 2*M, TT - TB),
-                                     radius=16, alpha=0.08)
-        tp.addSubview_(text_card)
-        pad = 10
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(
-            M + pad, TB + pad, cw - 2*M - 2*pad, TT - TB - 2*pad))
+        # ── Glass text card
+        TT, TB = TOP - 72, 258
+        cw, ch, pad = W - 2*M, TT - TB, 12
+        card, cc = glass_panel(NSMakeRect(M, TB, cw, ch), radius=24)
+        tp.addSubview_(card)
+        # Placeholder sits *under* the transparent text view, so clicks on it
+        # still land in the editor.
+        self._placeholder = self._label(
+            "Paste or type what you want typed…",
+            NSMakeRect(pad + 9, ch - pad - 30, cw - 2*pad - 20, 20), size=15, dim=True)
+        cc.addSubview_(self._placeholder)
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(pad, pad, cw - 2*pad, ch - 2*pad))
         scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
         scroll.setDrawsBackground_(False)
         scroll.setBorderType_(0)
         tv = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
-        tv.setFont_(NSFont.systemFontOfSize_(14))
+        tv.setFont_(NSFont.systemFontOfSize_(15))
+        tv.setTextColor_(NSColor.labelColor())
+        tv.setInsertionPointColor_(NSColor.controlAccentColor())
         tv.setRichText_(False)
         tv.setDrawsBackground_(False)
         tv.setAutomaticQuoteSubstitutionEnabled_(False)
@@ -882,254 +1084,247 @@ rm -- "$0"   # self-delete
         tv.setAutomaticTextReplacementEnabled_(False)
         tv.setAllowsUndo_(True)
         tv.setVerticallyResizable_(True)
-        tv.setMaxSize_(NSMakeSize(cw - 2*M - 2*pad, 1e7))
+        tv.setMaxSize_(NSMakeSize(cw - 2*pad, 1e7))
         tv.setTextContainerInset_((6, 8))
+        tv.setDelegate_(self)          # textDidChange_ keeps the stats live
         scroll.setDocumentView_(tv)
         self.text_view = tv
-        tp.addSubview_(scroll)
+        cc.addSubview_(scroll)
 
-        # ── Stats row — clean, no container
+        # ── Stats row
         self._stats_lbl = self._label(
-            "0 words  ·  0 chars",
-            NSMakeRect(M, 158, 160, 14), size=10, gray=True)
+            "0 words · 0 chars", NSMakeRect(M + 4, 230, 240, 16), size=11, gray=True)
         tp.addSubview_(self._stats_lbl)
-        tp.addSubview_(self._pill_button(
+        tp.addSubview_(self._glass_button(
             "Save as Snippet", b"saveSnippet:",
-            NSMakeRect(cw - M - 108, 156, 106, 18), style="ghost", size=10))
+            NSMakeRect(W - M - 150, 225, 150, 26), symbol="bookmark", size=12))
 
-        # ── Speed row — floating, no card container (cleaner)
-        tp.addSubview_(self._label("Speed",
-            NSMakeRect(M, 132, 44, 16), size=12, gray=True))
+        # ── Speed + realism in one inset-grouped glass card
+        ctl, c = glass_panel(NSMakeRect(M, 122, cw, 96), radius=22)
+        tp.addSubview_(ctl)
+        c.addSubview_(self._label("Speed", NSMakeRect(18, 63, 70, 18),
+                                  size=13, weight=NSFontWeightMedium))
         self._wpm_slider = self._add_slider(
-            tp, NSMakeRect(M + 50, 130, cw - 2*M - 106, 20),
+            c, NSMakeRect(96, 62, cw - 96 - 100, 20),
             10, 200, self._current_wpm, b"wpmSliderChanged:")
         self._wpm_lbl = self._label(
-            f"{self._current_wpm} wpm",
-            NSMakeRect(cw - M - 52, 131, 50, 18), size=12,
-            color=NSColor.controlAccentColor(), align=1)
-        tp.addSubview_(self._wpm_lbl)
+            f"{self._current_wpm} wpm", NSMakeRect(cw - 94, 63, 76, 18),
+            size=13, weight=NSFontWeightSemibold,
+            color=NSColor.controlAccentColor(), align=NSTextAlignmentRight)
+        c.addSubview_(self._wpm_lbl)
+        self._separator(c, 18, 48, cw - 36)
+        c.addSubview_(self._label("Realism", NSMakeRect(18, 15, 70, 18),
+                                  size=13, weight=NSFontWeightMedium))
+        self._realism_seg = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
+            list(REALISM), 0, self, b"realismChanged:")   # 0 = select-one
+        self._realism_seg.setFrame_(NSMakeRect(96, 11, 250, 26))
+        c.addSubview_(self._realism_seg)
+        self._realism_hint = self._label(
+            "", NSMakeRect(cw - 188, 15, 170, 18), size=12, gray=True,
+            align=NSTextAlignmentRight)
+        c.addSubview_(self._realism_hint)
+        self._sync_realism()
 
-        # ── Realism — 3 minimal pill buttons in a row (replaces bulky segmented control)
-        tp.addSubview_(self._label("Realism",
-            NSMakeRect(M, 100, 56, 16), size=12, gray=True))
-        self._realism_btns = {}
-        rnames = list(REALISM.keys())      # ["Minimal", "Natural", "Pro"]
-        rpw = 72                           # pill width
-        rph = 24
-        rx_start = M + 62
-        for ri, rname in enumerate(rnames):
-            rx = rx_start + ri * (rpw + 6)
-            rb = self._pill_button(rname,
-                b"realismPillPressed:", NSMakeRect(rx, 96, rpw, rph),
-                style="secondary", size=11)
-            rb.setTag_(ri)
-            tp.addSubview_(rb)
-            self._realism_btns[rname] = rb
-        self._update_realism_pills()
-
-        # ── Action buttons — prominent pill row
-        gap, bh = 6, 36
-        bw = (cw - 2*M - 3*gap) // 4
-        self.start_btn = self._pill_button(
-            "▶  Start", b"start:",
-            NSMakeRect(M, 52, bw, bh), style="primary")
-        self.pause_btn = self._pill_button(
-            "⏸  Pause", b"togglePause:",
-            NSMakeRect(M + bw + gap, 52, bw, bh))
-        self.stop_btn  = self._pill_button(
-            "⏹  Stop",  b"stop:",
-            NSMakeRect(M + (bw+gap)*2, 52, bw, bh))
-        self.end_btn   = self._pill_button(
-            "✕  Quit",  b"end:",
-            NSMakeRect(M + (bw+gap)*3, 52, bw, bh))
+        # ── Glass action group: controls in one container share a single
+        # material and melt together, like an iOS toolbar.
+        gap, bh = 10, 44
+        pw = 128
+        sw = cw - bh - 2*pw - 3*gap
+        grp, g = glass_group(NSMakeRect(M, 62, cw, bh), spacing=gap)
+        self.start_btn = self._glass_button(
+            "Start", b"start:", NSMakeRect(0, 0, sw, bh),
+            symbol="play.fill", prominent=True, size=15)
+        self.pause_btn = self._glass_button(
+            "Pause", b"togglePause:", NSMakeRect(sw + gap, 0, pw, bh),
+            symbol="pause.fill", size=14)
+        self.stop_btn = self._glass_button(
+            "Stop", b"stop:", NSMakeRect(sw + pw + 2*gap, 0, pw, bh),
+            symbol="stop.fill", size=14)
+        self.end_btn = self._glass_button(
+            "Quit HumanType", b"end:", NSMakeRect(cw - bh, 0, bh, bh),
+            symbol="power", icon_only=True)
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.end_btn):
-            tp.addSubview_(b)
+            g.addSubview_(b)
+        tp.addSubview_(grp)
 
-        # ── Thin progress bar
-        pb_y, pb_h = 40, 4
-        prog_track = self._glass_card(
-            NSMakeRect(M, pb_y, cw - 2*M, pb_h),
-            radius=2, alpha=0.06, border_alpha=0.10, sheen=False)
-        tp.addSubview_(prog_track)
-        self._prog_fill = NSView.alloc().initWithFrame_(NSMakeRect(M, pb_y, 0, pb_h))
-        self._prog_fill.setWantsLayer_(True)
-        self._prog_fill.layer().setCornerRadius_(2)
-        self._prog_fill.layer().setBackgroundColor_(
-            NSColor.controlAccentColor().CGColor())
+        # ── Thin progress capsule
+        pb_y, pb_h = 44, 5
+        tp.addSubview_(color_view(
+            NSMakeRect(M, pb_y, cw, pb_h),
+            NSColor.labelColor().colorWithAlphaComponent_(0.08), pb_h / 2))
+        self._prog_fill = color_view(NSMakeRect(M, pb_y, 0, pb_h),
+                                     NSColor.controlAccentColor(), pb_h / 2)
         tp.addSubview_(self._prog_fill)
-        self._prog_max_w = cw - 2*M
+        self._prog_max_w = cw
 
-        # ── Status + ETA + lock indicator
+        # ── Status + ETA
         self.status = self._label(
             "Ready — paste text above and press Start.",
-            NSMakeRect(M, 18, cw - 2*M - 76, 16), size=11, gray=True)
+            NSMakeRect(M + 4, 18, cw - 134, 16), size=11, gray=True)
         tp.addSubview_(self.status)
         self._eta_lbl = self._label(
-            "", NSMakeRect(cw - M - 74, 18, 72, 16),
-            size=11, gray=True, align=1)
+            "", NSMakeRect(W - M - 124, 18, 120, 16), size=11, gray=True,
+            align=NSTextAlignmentRight)
         tp.addSubview_(self._eta_lbl)
-        self._lock_lbl = self._label("", NSMakeRect(M, 2, cw - 2*M, 12),
-                                     size=9, dim=True)
-        tp.addSubview_(self._lock_lbl)
 
         self._prefill_from_clipboard()
         self._set_running(False)
 
-        # ── SNIPPETS TAB ─────────────────────────────────────────────────
-        self._tab_snippets = panel()
-        root.addSubview_(self._tab_snippets)
-        sp = self._tab_snippets
+    # ── Snippets page ────────────────────────────────────────────────────
 
-        sp.addSubview_(self._label(
-            "Snippets", NSMakeRect(M, H - 44, 110, 26), bold=True, size=20))
-        sp.addSubview_(self._label(
-            "Save texts you type often.",
-            NSMakeRect(M + 116, H - 40, cw - M - 120, 16), size=11, gray=True))
-
+    @objc.python_method
+    def _build_snippets_page(self, sp):
+        self._page_title(sp, "Snippets", "Save texts you type often, load them in one click.")
+        top = TOP - 72
         self._snip_search = NSSearchField.alloc().initWithFrame_(
-            NSMakeRect(M, H - 76, cw - 2*M, 30))
-        self._snip_search.setPlaceholderString_("Search snippets…")
+            NSMakeRect(M, top - 32, W - 2*M, 32))
+        self._snip_search.setControlSize_(NSControlSizeLarge)
+        self._snip_search.setPlaceholderString_("Search snippets")
         self._snip_search.setTarget_(self)
         self._snip_search.setAction_(b"snippetSearchChanged:")
         sp.addSubview_(self._snip_search)
 
-        snip_scroll = NSScrollView.alloc().initWithFrame_(
-            NSMakeRect(M, 58, cw - 2*M, H - 76 - 30 - 14))
+        cw, bottom = W - 2*M, 72
+        ch = top - 46 - bottom
+        card, c = glass_panel(NSMakeRect(M, bottom, cw, ch), radius=24)
+        sp.addSubview_(card)
+        self._snip_empty = NSTextField.wrappingLabelWithString_("")
+        self._snip_empty.setFrame_(NSMakeRect(40, ch / 2 - 20, cw - 80, 40))
+        self._snip_empty.setAlignment_(NSTextAlignmentCenter)
+        self._snip_empty.setFont_(NSFont.systemFontOfSize_(13))
+        self._snip_empty.setTextColor_(NSColor.secondaryLabelColor())
+        c.addSubview_(self._snip_empty)
+        snip_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 8, cw, ch - 16))
         snip_scroll.setHasVerticalScroller_(True)
+        snip_scroll.setAutohidesScrollers_(True)
         snip_scroll.setDrawsBackground_(False)
         snip_scroll.setBorderType_(0)
-        self._snip_list_view = NSView.alloc().initWithFrame_(
+        self._snip_list_view = FlippedView.alloc().initWithFrame_(
             snip_scroll.contentView().bounds())
         snip_scroll.setDocumentView_(self._snip_list_view)
-        sp.addSubview_(snip_scroll)
+        c.addSubview_(snip_scroll)
         self._snip_scroll = snip_scroll
 
-        sp.addSubview_(self._pill_button(
-            "+ New", b"newSnippet:", NSMakeRect(M, 22, 80, 28)))
-        sp.addSubview_(self._pill_button(
-            "Delete", b"deleteSnippet:", NSMakeRect(M + 88, 22, 80, 28)))
-        self._selected_snip_idx = -1
+        self._snip_count = self._label("", NSMakeRect(M + 4, 32, 200, 16),
+                                       size=11, gray=True)
+        sp.addSubview_(self._snip_count)
+        sp.addSubview_(self._glass_button(
+            "Save Current Text", b"saveSnippet:",
+            NSMakeRect(W - M - 190, 22, 190, 36), symbol="plus", size=13))
         self._rebuild_snippet_list("")
 
-        # ── SETTINGS TAB ─────────────────────────────────────────────────
-        self._tab_settings = panel()
-        root.addSubview_(self._tab_settings)
-        self._build_settings_panel(cw)
-
-        self._show_tab("type")
-
-    # ── Settings panel ────────────────────────────────────────────────────
+    # ── Settings page ────────────────────────────────────────────────────
 
     @objc.python_method
-    def _build_settings_panel(self, cw):
-        st = self._tab_settings
-        cx = M       # local x offset
-        st.addSubview_(self._label("Settings", NSMakeRect(cx, H - 46, cw - 2*M, 24),
-                                   bold=True, size=18))
-        y = H - 80
+    def _build_settings_panel(self, st):
+        self._page_title(st, "Settings", "Tune the typing and set your global shortcuts.")
+        y = TOP - 72                     # top of the next section
+        cw, row_h = W - 2*M, 38
 
-        def slider_row(label, key, lo, hi, cur, fmt, sel, step=None):
+        def card(title, n_rows):
+            """Section header + inset-grouped glass card; returns (content, h)."""
             nonlocal y
-            st.addSubview_(self._label(label, NSMakeRect(cx, y, 140, 17), size=12))
-            sl = NSSlider.alloc().initWithFrame_(NSMakeRect(cx + 144, y - 1, cw - 2*M - 210, 18))
-            sl.setMinValue_(lo); sl.setMaxValue_(hi); sl.setFloatValue_(cur)
-            sl.setTarget_(self); sl.setAction_(sel)
-            if step: sl.setAltIncrementValue_(step)
-            st.addSubview_(sl)
-            val_lbl = self._label(fmt(cur),
-                                  NSMakeRect(cw - M - 64, y, 62, 17),
-                                  size=12, gray=True, align=1)
-            st.addSubview_(val_lbl)
-            y -= 34
-            return sl, val_lbl
+            self._section_header(title, st, M + 16, y - 14, 200)
+            h = row_h * n_rows
+            panel, c = glass_panel(NSMakeRect(M, y - 20 - h, cw, h), radius=18)
+            st.addSubview_(panel)
+            for i in range(1, n_rows):
+                self._separator(c, 16, h - i * row_h, cw - 32)
+            y -= 20 + h + 14
+            return c, h
 
-        def checkbox_row(label, val, sel):
-            nonlocal y
-            cb = NSButton.checkboxWithTitle_target_action_(label, self, sel)
-            cb.setFrame_(NSMakeRect(cx, y, cw - 2*M, 20))
-            cb.setFont_(NSFont.systemFontOfSize_(12))
-            cb.setState_(1 if val else 0)
-            st.addSubview_(cb)
-            y -= 28
-            return cb
+        def row(h, i):                   # local bottom edge of row i (0 = top)
+            return h - (i + 1) * row_h
 
-        # Typing
-        self._section_header("Typing", st, cx, y + 2, 150)
-        y -= 18
-        self._st_wpm_sl, self._st_wpm_lbl = slider_row(
-            "Speed (WPM)", "ht_wpm", 10, 200, self._current_wpm,
-            lambda v: f"{int(v)} wpm", b"settingsWpmChanged:")
-        self._st_countdown_sl, self._st_countdown_lbl = slider_row(
-            "Countdown", "ht_countdown", 2, 20, self._countdown_secs,
-            lambda v: f"{int(v)}s", b"settingsCountdownChanged:", step=1)
+        def slider_row(c, ry, label, lo, hi, cur, fmt, sel):
+            c.addSubview_(self._label(label, NSMakeRect(16, ry + 10, 150, 18), size=13))
+            sl = self._add_slider(c, NSMakeRect(170, ry + 9, cw - 170 - 92, 20),
+                                  lo, hi, cur, sel)
+            val = self._label(fmt(cur), NSMakeRect(cw - 84, ry + 10, 68, 18),
+                              size=13, gray=True, align=NSTextAlignmentRight)
+            c.addSubview_(val)
+            return sl, val
 
-        y -= 8
-        self._section_header("Realism", st, cx, y + 2, 150)
-        y -= 18
-        _, _ = slider_row(
-            "Typo rate", "ht_typo", 0.0, 0.15,
-            REALISM[self._realism_name][0],
-            lambda v: f"{v*100:.0f}%", b"settingsTypoChanged:")
+        def switch_row(c, ry, label, on, sel):
+            c.addSubview_(self._label(label, NSMakeRect(16, ry + 10, cw - 100, 18), size=13))
+            sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(cw - 16 - 42, ry + 8, 42, 22))
+            sw.setState_(1 if on else 0)
+            sw.setTarget_(self)
+            sw.setAction_(sel)
+            c.addSubview_(sw)
+            return sw
 
-        y -= 8
-        self._section_header("Behaviour", st, cx, y + 2, 150)
-        y -= 18
-        self._st_auto_paste = checkbox_row(
-            "Auto-paste clipboard text on open",
-            self._auto_paste, b"settingsAutoPasteToggled:")
-        self._st_strip_fmt = checkbox_row(
-            "Strip rich formatting when pasting",
-            self._strip_fmt, b"settingsStripFmtToggled:")
-
-        y -= 8
-        self._section_header("Shortcuts", st, cx, y + 2, 150)
-        y -= 18
-
-        def shortcut_row(label, binding, sel):
-            nonlocal y
-            st.addSubview_(self._label(label, NSMakeRect(cx, y, 140, 22), size=12))
+        def shortcut_row(c, ry, label, binding, sel):
+            c.addSubview_(self._label(label, NSMakeRect(16, ry + 10, 200, 18), size=13))
             btn = self._button(binding_label(binding), sel,
-                               NSMakeRect(cw - M - 150, y - 2, 148, 26))
-            st.addSubview_(btn)
-            y -= 34
+                               NSMakeRect(cw - 16 - 130, ry + 5, 130, 28))
+            c.addSubview_(btn)
             return btn
 
+        c, h = card("Typing", 2)
+        self._st_wpm_sl, self._st_wpm_lbl = slider_row(
+            c, row(h, 0), "Speed", 10, 200, self._current_wpm,
+            lambda v: f"{int(v)} wpm", b"settingsWpmChanged:")
+        self._st_countdown_sl, self._st_countdown_lbl = slider_row(
+            c, row(h, 1), "Countdown", 2, 20, self._countdown_secs,
+            lambda v: f"{int(v)}s", b"settingsCountdownChanged:")
+        self._st_countdown_sl.setAltIncrementValue_(1)
+
+        c, h = card("Realism", 1)
+        override = NSUserDefaults.standardUserDefaults().floatForKey_("ht_typo_override")
+        self._st_typo_sl, self._st_typo_lbl = slider_row(
+            c, row(h, 0), "Typo rate", 0.0, 0.15, override,
+            _typo_label, b"settingsTypoChanged:")
+
+        c, h = card("Behaviour", 2)
+        self._st_auto_paste = switch_row(
+            c, row(h, 0), "Auto-paste clipboard text on open",
+            self._auto_paste, b"settingsAutoPasteToggled:")
+        self._st_strip_fmt = switch_row(
+            c, row(h, 1), "Flatten line breaks and extra spaces",
+            self._strip_fmt, b"settingsStripFmtToggled:")
+
+        c, h = card("Shortcuts", 4)
         self.start_stop_rec = shortcut_row(
-            "Start / Stop", self.start_stop_binding, b"recordStartStop:")
+            c, row(h, 0), "Start / Stop", self.start_stop_binding, b"recordStartStop:")
         self.pause_rec = shortcut_row(
-            "Pause / Resume", self.pause_binding, b"recordPause:")
+            c, row(h, 1), "Pause / Resume", self.pause_binding, b"recordPause:")
         self.stop_rec = shortcut_row(
-            "Stop", self.stop_binding, b"recordStop:")
+            c, row(h, 2), "Stop", self.stop_binding, b"recordStop:")
         self.lock_rec = shortcut_row(
-            "Lock keyboard", self.lock_binding, b"recordLock:")
+            c, row(h, 3), "Lock keyboard", self.lock_binding, b"recordLock:")
+
+        self._version_lbl = self._label(
+            f"HumanType {APP_VERSION}", NSMakeRect(M, 18, cw, 16), size=11,
+            dim=True, align=NSTextAlignmentCenter)
+        st.addSubview_(self._version_lbl)
 
     # ── Tab switching ────────────────────────────────────────────────────
 
     @objc.python_method
-    def _show_tab(self, name):
+    def _show_tab(self, name, animate=True):
         self._active_tab = name
         panels = {"type": self._tab_type,
                   "snippets": self._tab_snippets,
                   "settings": self._tab_settings}
         for k, p in panels.items():
             p.setHidden_(k != name)
-        # iOS 26-style nav pill: active = accent tint, inactive = clear
+        # Slide the lens under the selected tab with a slight overshoot — the
+        # "liquid" settle of the iOS tab bar — and tint that tab like iOS does.
+        target = self._nav_btns[name].frame()
+        if animate and not reduce_motion():
+            NSAnimationContext.beginGrouping()
+            ctx = NSAnimationContext.currentContext()
+            ctx.setDuration_(0.34)
+            ctx.setTimingFunction_(
+                CAMediaTimingFunction.functionWithControlPoints____(0.3, 1.3, 0.5, 1.0))
+            self._tab_lens.animator().setFrame_(target)
+            NSAnimationContext.endGrouping()
+        else:
+            self._tab_lens.setFrame_(target)
         for k, btn in self._nav_btns.items():
-            l = btn.layer()
-            if k == name:
-                l.setBackgroundColor_(
-                    NSColor.controlAccentColor()
-                    .colorWithAlphaComponent_(0.18).CGColor())
-                l.setBorderColor_(
-                    NSColor.controlAccentColor()
-                    .colorWithAlphaComponent_(0.35).CGColor())
-                btn.setContentTintColor_(NSColor.controlAccentColor())
-            else:
-                l.setBackgroundColor_(
-                    NSColor.colorWithWhite_alpha_(1.0, 0.10).CGColor())
-                l.setBorderColor_(
-                    NSColor.colorWithWhite_alpha_(1.0, 0.20).CGColor())
-                btn.setContentTintColor_(NSColor.labelColor())
+            btn.setContentTintColor_(NSColor.labelColor() if k == name
+                                     else NSColor.secondaryLabelColor())
 
     def showTabType_(self, sender):
         self._show_tab("type")
@@ -1143,55 +1338,54 @@ rm -- "$0"   # self-delete
 
     # ── Speed / realism controls ─────────────────────────────────────────
 
-    def wpmSliderChanged_(self, sender):
-        self._current_wpm = max(10, int(sender.intValue()))
-        self._wpm_lbl.setStringValue_(f"{self._current_wpm} wpm")
+    @objc.python_method
+    def _apply_wpm(self, wpm):
+        """The one place a speed change lands: both sliders, their labels,
+        the saved default and the menu-bar Speed submenu."""
+        self._current_wpm = max(10, int(wpm))
+        for sl, lbl in ((getattr(self, "_wpm_slider", None), getattr(self, "_wpm_lbl", None)),
+                        (getattr(self, "_st_wpm_sl", None), getattr(self, "_st_wpm_lbl", None))):
+            if sl is not None:
+                sl.setIntValue_(self._current_wpm)
+            if lbl is not None:
+                lbl.setStringValue_(f"{self._current_wpm} wpm")
         NSUserDefaults.standardUserDefaults().setInteger_forKey_(
             self._current_wpm, "ht_wpm")
         self._sync_speed_menu()
 
-    def realismPillPressed_(self, sender):
-        idx = int(sender.tag())
-        self._realism_name = list(REALISM.keys())[idx]
-        NSUserDefaults.standardUserDefaults().setObject_forKey_(
-            self._realism_name, "ht_realism")
-        self._update_realism_pills()
-
-    # keep old selector alive for the settings segmented control
-    def realismChanged_(self, sender):
-        idx = int(sender.selectedSegment())
-        self._realism_name = list(REALISM.keys())[idx]
-        NSUserDefaults.standardUserDefaults().setObject_forKey_(
-            self._realism_name, "ht_realism")
-        self._update_realism_pills()
-
-    @objc.python_method
-    def _update_realism_pills(self):
-        """Style realism pill buttons: selected = accent tint, rest = secondary."""
-        for name, btn in getattr(self, "_realism_btns", {}).items():
-            l = btn.layer()
-            if name == self._realism_name:
-                l.setBackgroundColor_(
-                    NSColor.controlAccentColor()
-                    .colorWithAlphaComponent_(0.20).CGColor())
-                l.setBorderColor_(
-                    NSColor.controlAccentColor()
-                    .colorWithAlphaComponent_(0.50).CGColor())
-                btn.setContentTintColor_(NSColor.controlAccentColor())
-            else:
-                l.setBackgroundColor_(
-                    NSColor.colorWithWhite_alpha_(1.0, 0.08).CGColor())
-                l.setBorderColor_(
-                    NSColor.colorWithWhite_alpha_(1.0, 0.18).CGColor())
-                btn.setContentTintColor_(NSColor.secondaryLabelColor())
+    def wpmSliderChanged_(self, sender):
+        self._apply_wpm(sender.intValue())
 
     def settingsWpmChanged_(self, sender):
-        self._current_wpm = max(10, int(sender.intValue()))
-        self._st_wpm_lbl.setStringValue_(f"{self._current_wpm} wpm")
-        self._wpm_slider.setIntValue_(self._current_wpm)
-        NSUserDefaults.standardUserDefaults().setInteger_forKey_(
-            self._current_wpm, "ht_wpm")
-        self._sync_speed_menu()
+        self._apply_wpm(sender.intValue())
+
+    def realismChanged_(self, sender):
+        # Picking a preset takes over from any manual typo rate in Settings.
+        self._realism_name = list(REALISM)[int(sender.selectedSegment())]
+        d = NSUserDefaults.standardUserDefaults()
+        d.setObject_forKey_(self._realism_name, "ht_realism")
+        d.removeObjectForKey_("ht_typo_override")
+        if hasattr(self, "_st_typo_sl"):
+            self._st_typo_sl.setFloatValue_(0.0)
+            self._st_typo_lbl.setStringValue_(_typo_label(0.0))
+        self._sync_realism()
+
+    @objc.python_method
+    def _typo_rate(self):
+        """Effective typo rate: the Settings override if set, else the preset."""
+        override = NSUserDefaults.standardUserDefaults().floatForKey_("ht_typo_override")
+        if override > 0:
+            return override
+        return REALISM.get(self._realism_name, REALISM["Natural"])[0]
+
+    @objc.python_method
+    def _sync_realism(self):
+        if not hasattr(self, "_realism_seg"):
+            return
+        self._realism_seg.setSelectedSegment_(list(REALISM).index(self._realism_name))
+        rate = self._typo_rate()
+        self._realism_hint.setStringValue_(
+            f"~{rate * 100:.0f}% typos, self-fixed" if rate else "No typos")
 
     def settingsCountdownChanged_(self, sender):
         self._countdown_secs = max(1, int(sender.intValue()))
@@ -1200,9 +1394,11 @@ rm -- "$0"   # self-delete
             self._countdown_secs, "ht_countdown")
 
     def settingsTypoChanged_(self, sender):
-        # Typo rate changes applied directly to next session
+        # Applied to the next session; 0 hands control back to the preset.
         rate = max(0.0, min(0.15, float(sender.floatValue())))
         NSUserDefaults.standardUserDefaults().setFloat_forKey_(rate, "ht_typo_override")
+        self._st_typo_lbl.setStringValue_(_typo_label(rate))
+        self._sync_realism()
 
     def settingsAutoPasteToggled_(self, sender):
         self._auto_paste = bool(sender.state())
@@ -1232,7 +1428,6 @@ rm -- "$0"   # self-delete
     @objc.python_method
     def _rebuild_snippet_list(self, query):
         sv = self._snip_list_view
-        # Remove existing subviews
         for sub in list(sv.subviews()):
             sub.removeFromSuperview()
         snips = self._load_snippets()
@@ -1240,31 +1435,38 @@ rm -- "$0"   # self-delete
         visible = [(i, s) for i, s in enumerate(snips)
                    if not q or q in s.get("title", "").lower()
                    or q in s.get("text", "").lower()]
-        row_h = 56
-        total_h = max(self._snip_scroll.contentView().bounds().size.height,
-                      len(visible) * row_h)
-        sv.setFrame_(NSMakeRect(0, 0,
-                                self._snip_scroll.contentView().bounds().size.width,
-                                total_h))
-        for list_i, (orig_i, s) in enumerate(visible):
-            y = total_h - (list_i + 1) * row_h
-            row = self._card(NSMakeRect(4, y + 3, sv.frame().size.width - 8, row_h - 6),
-                             fill=0.07 if orig_i == self._selected_snip_idx else 0.04)
-            title_lbl = self._label(s.get("title", "Untitled"),
-                                    NSMakeRect(10, 22, sv.frame().size.width - 60, 18),
-                                    bold=True, size=12)
-            preview = s.get("text", "")[:80].replace("\n", " ")
-            preview_lbl = self._label(preview,
-                                      NSMakeRect(10, 6, sv.frame().size.width - 60, 14),
-                                      size=10, gray=True)
-            load_btn = NSButton.buttonWithTitle_target_action_(
-                "Load", self, b"loadSnippetRow:")
-            load_btn.setTag_(orig_i)
-            load_btn.setFrame_(NSMakeRect(sv.frame().size.width - 56, 14, 48, 24))
-            row.addSubview_(title_lbl)
-            row.addSubview_(preview_lbl)
-            row.addSubview_(load_btn)
+        clip = self._snip_scroll.contentView().bounds().size
+        width, row_h = clip.width, 64
+        sv.setFrame_(NSMakeRect(0, 0, width, max(clip.height, len(visible) * row_h)))
+        text_w = width - 20 - 150
+        for n, (orig_i, s) in enumerate(visible):
+            row = NSView.alloc().initWithFrame_(NSMakeRect(0, n * row_h, width, row_h))
+            if n:
+                self._separator(row, 20, row_h - 0.5, width - 40)
+            title = self._label(s.get("title") or "Untitled",
+                                NSMakeRect(20, 33, text_w, 18), size=13,
+                                weight=NSFontWeightSemibold)
+            preview = self._label(" ".join(s.get("text", "").split())[:160],
+                                  NSMakeRect(20, 13, text_w, 16), size=11, gray=True)
+            for lbl in (title, preview):
+                lbl.setLineBreakMode_(NSLineBreakByTruncatingTail)
+                row.addSubview_(lbl)
+            load = self._glass_button("Load", b"loadSnippetRow:",
+                                      NSMakeRect(width - 138, 17, 80, 30),
+                                      symbol="arrow.up.doc", size=12)
+            trash = self._glass_button("Delete Snippet", b"deleteSnippetRow:",
+                                       NSMakeRect(width - 50, 17, 30, 30),
+                                       symbol="trash", icon_only=True)
+            for b in (load, trash):
+                b.setTag_(orig_i)
+                row.addSubview_(b)
             sv.addSubview_(row)
+        self._snip_empty.setHidden_(bool(visible))
+        self._snip_empty.setStringValue_(
+            "No matching snippets." if snips else
+            "No snippets yet.\nUse “Save as Snippet” on the Type tab.")
+        count = len(snips)
+        self._snip_count.setStringValue_(f"{count} snippet{'' if count == 1 else 's'}")
 
     def snippetSearchChanged_(self, sender):
         self._rebuild_snippet_list(str(sender.stringValue()))
@@ -1282,33 +1484,26 @@ rm -- "$0"   # self-delete
         self._rebuild_snippet_list("")
         self._set_status(f"Saved snippet: {title}")
 
-    def newSnippet_(self, sender):
+    def deleteSnippetRow_(self, sender):
+        idx = int(sender.tag())
         snips = self._load_snippets()
-        snips.insert(0, {"title": "New Snippet", "text": ""})
-        self._save_snippets(snips)
-        self._rebuild_snippet_list("")
-        self._show_tab("snippets")
-
-    def deleteSnippet_(self, sender):
-        if self._selected_snip_idx < 0:
-            return
-        snips = self._load_snippets()
-        if 0 <= self._selected_snip_idx < len(snips):
-            snips.pop(self._selected_snip_idx)
+        if 0 <= idx < len(snips):
+            snips.pop(idx)
             self._save_snippets(snips)
-            self._selected_snip_idx = -1
-            self._rebuild_snippet_list("")
+            self._rebuild_snippet_list(str(self._snip_search.stringValue()))
 
     def loadSnippetRow_(self, sender):
         idx = int(sender.tag())
         snips = self._load_snippets()
         if 0 <= idx < len(snips):
             self.text_view.setString_(snips[idx].get("text", ""))
-            self._selected_snip_idx = idx
             self._show_tab("type")
             self._update_stats()
 
     # ── Stats / progress helpers ─────────────────────────────────────────
+
+    def textDidChange_(self, notification):
+        self._update_stats()
 
     @objc.python_method
     def _update_stats(self):
@@ -1316,6 +1511,7 @@ rm -- "$0"   # self-delete
         words = len(text.split()) if text.strip() else 0
         chars = len(text)
         self._stats_lbl.setStringValue_(f"{words:,} words · {chars:,} chars")
+        self._placeholder.setHidden_(chars > 0)
 
     @objc.python_method
     def _update_progress(self, done, total):
@@ -1373,11 +1569,16 @@ rm -- "$0"   # self-delete
         self.status.setStringValue_(text)
 
     @objc.python_method
+    def _set_pause_btn(self, paused):
+        self.pause_btn.setTitle_("Resume" if paused else "Pause")
+        set_symbol(self.pause_btn, "play.fill" if paused else "pause.fill")
+
+    @objc.python_method
     def _set_running(self, running):
         self.start_btn.setEnabled_(not running)
         self.pause_btn.setEnabled_(running)
         self.stop_btn.setEnabled_(running)
-        self.pause_btn.setTitle_("⏸  Pause")
+        self._set_pause_btn(False)
         if not running:
             self._update_progress(0, 1)
             self._eta_lbl.setStringValue_("")
@@ -1396,14 +1597,7 @@ rm -- "$0"   # self-delete
 
     def setSpeedFromMenu_(self, sender):
         name = str(sender.title())
-        self._current_wpm = SPEED_WPM.get(name, 55)
-        if hasattr(self, "_wpm_slider"):
-            self._wpm_slider.setIntValue_(self._current_wpm)
-        if hasattr(self, "_wpm_lbl"):
-            self._wpm_lbl.setStringValue_(f"{self._current_wpm} wpm")
-        NSUserDefaults.standardUserDefaults().setInteger_forKey_(
-            self._current_wpm, "ht_wpm")
-        self._sync_speed_menu()
+        self._apply_wpm(SPEED_WPM.get(name, 55))
         self._set_status(f"Speed set to {name} ({self._current_wpm} wpm).")
 
     # ── Actions ───────────────────────────────────────────────────────────
@@ -1447,12 +1641,7 @@ rm -- "$0"   # self-delete
             return
 
         wpm = self._current_wpm
-        typo_override = NSUserDefaults.standardUserDefaults().floatForKey_("ht_typo_override")
-        _, realism_var, _ = REALISM.get(self._realism_name, REALISM["Natural"])
-        if typo_override > 0:
-            mistake_rate = typo_override
-        else:
-            mistake_rate = REALISM.get(self._realism_name, REALISM["Natural"])[0]
+        mistake_rate = self._typo_rate()
 
         self.state = ht.TypingState()
 
@@ -1651,7 +1840,7 @@ rm -- "$0"   # self-delete
         """Sync the Pause button label after a hotkey-driven pause toggle."""
         if self.state is None:
             return
-        self.pause_btn.setTitle_("▶  Resume" if self.state.paused else "⏸  Pause")
+        self._set_pause_btn(self.state.paused)
         self._set_status("Paused." if self.state.paused else "Typing…")
 
     def toggleLock_(self, sender):
@@ -1677,7 +1866,7 @@ rm -- "$0"   # self-delete
         if self._kbd_locked:
             self._set_status("Keyboard locked — physical keys ignored.")
             if hasattr(self, "_lock_lbl"):
-                self._lock_lbl.setStringValue_("🔒  Keyboard locked — click menu-bar icon to unlock")
+                self._lock_lbl.setStringValue_("Keyboard locked · unlock from the menu bar")
         else:
             self._set_status("Keyboard unlocked.")
             if hasattr(self, "_lock_lbl"):
@@ -1766,7 +1955,7 @@ rm -- "$0"   # self-delete
         if self.state is None or self._typing_gen is None:
             return
         self.state.toggle_pause()
-        self.pause_btn.setTitle_("▶  Resume" if self.state.paused else "⏸  Pause")
+        self._set_pause_btn(self.state.paused)
         self._set_status("Paused." if self.state.paused else "Typing…")
 
     def stop_(self, sender):
