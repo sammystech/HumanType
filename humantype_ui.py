@@ -14,6 +14,7 @@ build_humantype.sh checks that for the bundle."""
 
 import json
 import os
+import ssl
 import sys
 import threading
 import urllib.error
@@ -130,6 +131,16 @@ GITHUB_REPO     = "sammystech/HumanType"
 UPDATE_URL      = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_INTERVAL = 6 * 3600   # re-check while running; menu-bar apps run for days
 
+# HTTPS trust. The bundled OpenSSL only looks for Homebrew's cert.pem, which
+# most Macs don't have, so every request would fail certificate verification
+# there. Verify against certifi's CA roots, shipped inside the app instead.
+try:
+    import certifi
+    CA_FILE = certifi.where()
+except ImportError:        # running from source without certifi
+    CA_FILE = None
+TLS = ssl.create_default_context(cafile=CA_FILE)
+
 
 def _version_tuple(v):
     """Convert "1.2.3" to (1, 2, 3) for comparisons."""
@@ -146,7 +157,7 @@ def fetch_latest_release():
         "Accept": "application/vnd.github+json",
         "User-Agent": f"HumanType/{APP_VERSION}"})
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=TLS) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         if exc.code == 404:      # repo has no releases yet
@@ -376,7 +387,7 @@ class LicenseManager:
             req  = urllib.request.Request(
                 VALIDATE_URL, data=body, method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=12, context=TLS) as resp:
                 data = json.loads(resp.read())
             if data.get("valid"):
                 return True, data.get("email", "")
@@ -717,6 +728,9 @@ class AppController(NSObject):
             "It downloads in the background, then HumanType reopens on the new version.")
         alert.addButtonWithTitle_("Download & Install")
         alert.addButtonWithTitle_("Later")
+        # The prompt takes focus when it appears, so a Return meant for
+        # whatever you were typing in must not install: only a click does.
+        alert.buttons()[0].setKeyEquivalent_("")
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         if alert.runModal() == NSAlertFirstButtonReturn:
             self._start_update_download(info)
@@ -745,12 +759,18 @@ class AppController(NSObject):
         """Download the new DMG and trigger the install shim."""
         tmp_dmg = f"/tmp/HumanType_update_{version}.dmg"
         try:
-            def reporthook(count, block_size, total_size):
-                if total_size > 0:
-                    pct = min(100, int(count * block_size * 100 / total_size))
-                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                        b"_updateDownloadProgress:", pct, False)
-            urllib.request.urlretrieve(url, tmp_dmg, reporthook)
+            req = urllib.request.Request(
+                url, headers={"User-Agent": f"HumanType/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=30, context=TLS) as resp, \
+                    open(tmp_dmg, "wb") as fh:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                while chunk := resp.read(256 * 1024):
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                            b"_updateDownloadProgress:", min(100, done * 100 // total), False)
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 b"_installUpdate:", tmp_dmg, False)
         except Exception as e:

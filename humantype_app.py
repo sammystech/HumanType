@@ -25,9 +25,14 @@ if __name__ == "__main__":
 
     if "--selftest" in sys.argv:
         # Verify every bundled dependency imports + constructs, then exit.
+        import os
         import humantype
         import humantype_ui  # noqa: F401  (pulls in AppKit/Foundation/Quartz)
         humantype.build_intercept(humantype.TypingState())
+        # Without bundled CA roots every HTTPS request (update checks, license
+        # validation) fails on Macs that don't have Homebrew.
+        if not (humantype_ui.CA_FILE and os.path.exists(humantype_ui.CA_FILE)):
+            sys.exit("selftest FAIL: CA bundle missing from the app")
         print("selftest OK")
         sys.exit(0)
 
