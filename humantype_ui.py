@@ -123,7 +123,7 @@ import humantype as ht
 # ---------------------------------------------------------------------------
 # App version + updates
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # Updates ship as GitHub Releases: release.sh bumps APP_VERSION, builds the DMG,
 # tags vX.Y.Z and attaches the DMG. Every installed copy polls the latest one.
