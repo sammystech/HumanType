@@ -31,10 +31,9 @@ Needs **macOS 26 (Tahoe) or later** on an **Apple Silicon** Mac (M1 or newer).
 
    <img src="docs/install.png" width="420" alt="The installer window: drag HumanType onto Applications">
 
-2. Open HumanType from Applications. The first time, macOS says it
-   *can't verify the developer*. That's expected for apps shared outside the
-   App Store. Click **Done**, then go to **System Settings → Privacy & Security**,
-   scroll down, and click **Open Anyway** next to HumanType. You only do this once.
+2. Open HumanType from Applications. It's notarized by Apple, so macOS just
+   asks once whether you want to open an app downloaded from the internet:
+   click **Open**.
 3. HumanType lives in the menu bar (the ⌨ keyboard icon), not the Dock.
 4. The first time you press **Start**, macOS asks you to allow **Accessibility**
    for HumanType, which it needs to type into other apps. Switch it on under
@@ -89,9 +88,10 @@ that executable links the macOS 26+ SDK. PyPI's prebuilt one links an older
 SDK, which silently drops the whole app into the old look. The build refuses
 to finish if that happens.
 
-The app is signed with your Apple Development certificate if you have one.
-Keep signing with the same certificate: the Accessibility permission is tied
-to it, which is why it survives updates.
+The app is signed with your Developer ID certificate if you have one (else
+Apple Development, else ad-hoc), with the hardened runtime. Keep signing with
+the same certificate: the Accessibility permission is tied to it, which is
+why it survives updates.
 
 ### Ship an update
 
@@ -99,10 +99,14 @@ to it, which is why it survives updates.
 ./release.sh 1.2.0 "What changed, in a sentence or two"
 ```
 
-That bumps the version, builds and self-tests, commits, tags `v1.2.0`,
-pushes, and publishes a GitHub Release with the DMG attached. Everyone's
-installed copy picks it up on its next check. Releases have to go up in
-version, and are built from a clean `main`.
+That bumps the version, builds and self-tests, has Apple notarize the app,
+commits, tags `v1.2.0`, pushes, and publishes a GitHub Release with the DMG
+attached. Everyone's installed copy picks it up on its next check. Releases
+have to go up in version, and are built from a clean `main`.
+
+Notarization (`tools/notarize.sh`) goes through the Apple account signed in to
+Xcode (**Xcode → Settings → Accounts**, Developer ID team), so there's no
+password to set up. It usually takes a minute or two.
 
 ### Command line
 

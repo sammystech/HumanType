@@ -4,7 +4,8 @@
 # Produces dist/HumanType.app and the drag-to-install dist/HumanType.dmg,
 # installs the app to /Applications (skip with INSTALL=0), and self-tests the
 # real bundle (including the main-thread keystroke path that used to crash on
-# Start).
+# Start). NOTARIZE=1 (release.sh sets it) also has Apple notarize the app and
+# staples the ticket, so it opens on any Mac without a Gatekeeper warning.
 #
 # The first run creates .venv and compiles PyInstaller's bootloader from
 # source. That matters: the bootloader becomes the app's main executable, and
@@ -46,23 +47,34 @@ if [ "${SDK%%.*}" -lt 26 ]; then
 fi
 echo "    executable links the macOS $SDK SDK (Liquid Glass enabled)"
 
-# Sign with a stable identity (Apple Development / Developer ID) so the macOS
-# Accessibility grant survives rebuilds AND in-app updates. Ad-hoc ("-") works
-# but every new build then needs the permission granted again.
-SIGN_ID="${SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
-          | awk '/Apple Development|Developer ID/{print $2; exit}')}"
-[ -z "$SIGN_ID" ] && SIGN_ID="-"
+# Sign with a stable identity so the macOS Accessibility grant survives
+# rebuilds AND in-app updates: Developer ID (what releases ship with, and what
+# notarization requires), else Apple Development, else ad-hoc ("-"), which works
+# but needs the permission granted again after every build. The hardened
+# runtime is a notarization requirement; the app needs no extra entitlements.
+IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null)
+SIGN_ID="${SIGN_ID:-$(echo "$IDENTITIES" | awk '/Developer ID Application/{print $2; exit}')}"
+SIGN_ID="${SIGN_ID:-$(echo "$IDENTITIES" | awk '/Apple Development/{print $2; exit}')}"
+SIGN_ID="${SIGN_ID:--}"
+SIGN_OPTS=(--options runtime)
+[ "$SIGN_ID" != "-" ] && SIGN_OPTS+=(--timestamp)
 echo "==> Code signing with identity: $SIGN_ID"
-codesign --force --deep --sign "$SIGN_ID" "$APP"
+codesign --force --deep "${SIGN_OPTS[@]}" --sign "$SIGN_ID" "$APP"
 codesign --verify --deep --strict "$APP" && echo "    signature OK"
 
 echo "==> Verifying the bundled binary (main-thread typing path)"
 "$EXE" --selftest
 "$EXE" --selftest-typing   # exits non-zero if the Start crash path is back
 
+if [ "${NOTARIZE:-0}" = 1 ]; then
+  tools/notarize.sh "$APP"
+  "$EXE" --selftest          # Xcode re-signed it: check the copy that ships
+fi
+
 echo "==> Building drag-to-install DMG"
 "$VENV/bin/python" tools/make_dmg_background.py
 "$VENV/bin/dmgbuild" -s dmg_settings.py -D app="$APP" "HumanType" "$DMG"
+[ "$SIGN_ID" != "-" ] && codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
 # Run the in-app updater's own gate on the app inside the DMG: installed copies
 # refuse any update whose bundle fails this, so a DMG that fails it strands them.
 MNT=$(hdiutil attach "$DMG" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)

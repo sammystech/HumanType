@@ -2,8 +2,9 @@
 # Ship an update to everyone running HumanType.
 #   ./release.sh 1.2.0 "What changed, in a sentence or two"
 #
-# Bumps APP_VERSION, builds and self-tests the app, commits, tags v1.2.0,
-# pushes, and publishes a GitHub Release with HumanType.dmg attached. Every
+# Bumps APP_VERSION, builds and self-tests the app, has Apple notarize it
+# (through the account signed in to Xcode; see tools/notarize.sh), commits,
+# tags v1.2.0, pushes, and publishes a GitHub Release with HumanType.dmg attached. Every
 # installed copy checks the latest release a few seconds after launch and every
 # 6 hours, then offers Download & Install. Menu bar > Check for Updates checks
 # right away.
@@ -30,7 +31,7 @@ echo "==> $CURRENT -> $VERSION"
 sed -i '' "s/^APP_VERSION = \".*\"/APP_VERSION = \"$VERSION\"/" humantype_ui.py
 TRAPZERR() { git checkout -- humantype_ui.py; echo "!! Release failed; version bump reverted."; }
 
-./build_humantype.sh
+NOTARIZE=1 ./build_humantype.sh
 
 git commit -q -am "Release v$VERSION"
 git tag -a "v$VERSION" -m "HumanType $VERSION"
