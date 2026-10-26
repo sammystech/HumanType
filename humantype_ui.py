@@ -552,6 +552,12 @@ KEYNAMES = {
 }
 
 
+# Bindings that act in every app even when idle, and the modifiers they need.
+ALWAYS_ON = ("start_stop", "lock")
+HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
+               | ht.kCGEventFlagMaskAlternate)
+
+
 def binding_label(binding):
     keycode, mods = binding
     out = ""
@@ -616,8 +622,11 @@ class AppController(NSObject):
     def _load_binding(self, d, prefix, default):
         if d.objectForKey_(prefix + "_kc") is None:
             return default
-        return (int(d.integerForKey_(prefix + "_kc")),
-                int(d.integerForKey_(prefix + "_mods")))
+        binding = (int(d.integerForKey_(prefix + "_kc")),
+                   int(d.integerForKey_(prefix + "_mods")))
+        if prefix in ALWAYS_ON and not binding[1] & HOTKEY_MODS:
+            return default    # saved before bare keys were refused (see _record)
+        return binding
 
     @objc.python_method
     def _save_binding(self, prefix, binding):
@@ -1786,7 +1795,12 @@ rm -- "$0"   # self-delete
         from Quartz import (CGEventGetIntegerValueField,
                             kCGEventSourceUnixProcessID,
                             kCGKeyboardEventAutorepeat,
-                            kCGKeyboardEventKeycode, CGEventGetFlags)
+                            kCGKeyboardEventKeycode, CGEventGetFlags,
+                            CGEventSetFlags, kCGEventKeyUp,
+                            kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
+                            kCGEventFlagMaskAlternate)
+        HOLD_MODS = (kCGEventFlagMaskCommand | kCGEventFlagMaskControl
+                     | kCGEventFlagMaskAlternate)
 
         def tap_callback(proxy, etype, event, refcon):
             if etype in (kCGEventTapDisabledByTimeout,
@@ -1794,13 +1808,22 @@ rm -- "$0"   # self-delete
                 if self._tap is not None:
                     CGEventTapEnable(self._tap, True)
                 return event
+            # Our own injected keystrokes carry a non-zero process id — always let
+            # them through (this is what reaches the document while locked). They
+            # inherit whatever modifiers are physically held, so if you're holding
+            # ⌘/⌃/⌥ for a hotkey mid-typing, the next typed letter would land as
+            # ⌘+letter (close tab, select all…). Strip those bits; Shift stays,
+            # since that's how capitals are typed.
+            if CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0:
+                flags = int(CGEventGetFlags(event))
+                if flags & HOLD_MODS:
+                    CGEventSetFlags(event, flags & ~HOLD_MODS)
+                return event
             if etype != kCGEventKeyDown:
                 return event
-            # Our own injected keystrokes carry a non-zero process id — always let
-            # them through (this is what reaches the document while locked).
-            if CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0:
-                return event
 
+            if self._monitor is not None:
+                return event      # recording a shortcut: let the recorder see it
             autorepeat = bool(CGEventGetIntegerValueField(
                 event, kCGKeyboardEventAutorepeat))
             keycode = int(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode))
@@ -1855,7 +1878,8 @@ rm -- "$0"   # self-delete
         self._tap_callback = tap_callback
         tap = CGEventTapCreate(
             kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
-            CGEventMaskBit(kCGEventKeyDown), tap_callback, None)
+            CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp),
+            tap_callback, None)
         if not tap:
             self._tap = None
             return
@@ -2051,6 +2075,12 @@ rm -- "$0"   # self-delete
                 return None
 
             binding = (keycode, mods)
+            # Start/Stop and Lock are live in every app all the time, so a bare
+            # key (Tab, a letter) would stop working everywhere. Require ⌘/⌃/⌥.
+            if which in ALWAYS_ON and not mods & HOTKEY_MODS:
+                button.setTitle_(prev_label)
+                self._set_status("Add ⌘, ⌃ or ⌥ — this shortcut works in every app.")
+                return None
             # Reject a combo already assigned to another action — otherwise the
             # tap's first-match-wins order would silently disable one of them.
             taken = {k: v for k, v in self._bindings().items() if k != which}

@@ -121,6 +121,10 @@ class _CTypesKeyboard:
             ctypes.c_void_p, ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_uint16)]
         cg.CGEventPost.restype  = None
+        cg.CGEventGetFlags.restype  = ctypes.c_uint64
+        cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
+        cg.CGEventSetFlags.restype  = None
+        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
         cls._cg = cg
         cf = ctypes.cdll.LoadLibrary(
@@ -149,13 +153,17 @@ class _CTypesKeyboard:
                     if ch and len(ch) == 1 and ch not in self._char_map:
                         self._char_map[ch] = (vk, mod != 0)
 
-    def _post_key(self, vk, down):
-        """Post one raw key event. Never touches CGEventSetFlags — altering flags
-        strips internal bits (e.g. 0x20000000) that macOS needs for correct
-        routing. Modifier state is managed by posting real shift key events
-        (kCGEventFlagsChanged) instead."""
+    def _post_key(self, vk, down, shift=None):
+        """Post one raw key event. Flags are never replaced wholesale — that
+        strips internal bits (e.g. 0x20000000) macOS needs for routing. For
+        character keys (shift=True/False) only the Shift bit is set or cleared:
+        the posted Shift key updates the system modifier state asynchronously,
+        so a key posted right after it often missed it ("The" → "the", "!" → "1")."""
         ev = self._cg.CGEventCreateKeyboardEvent(None, vk, down)
         if ev:
+            if shift is not None:
+                flags = self._cg.CGEventGetFlags(ev) & ~kCGEventFlagMaskShift
+                self._cg.CGEventSetFlags(ev, flags | (kCGEventFlagMaskShift if shift else 0))
             self._cg.CGEventPost(0, ev)   # 0 = kCGHIDEventTap
             self._cf.CFRelease(ev)
 
@@ -170,8 +178,8 @@ class _CTypesKeyboard:
             vk, shift = entry
             if shift:
                 self._post_key(self._SHIFT_VK, True)   # shift down → system state = shift held
-            self._post_key(vk, True)                    # char key down (inherits shift state)
-            self._post_key(vk, False)                   # char key up
+            self._post_key(vk, True, shift)             # char key down, Shift bit set explicitly
+            self._post_key(vk, False, shift)            # char key up
             if shift:
                 self._post_key(self._SHIFT_VK, False)   # shift up → system state = no shift
         else:
