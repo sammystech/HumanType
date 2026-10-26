@@ -128,7 +128,9 @@ APP_VERSION = "1.2.1"
 # Updates ship as GitHub Releases: release.sh bumps APP_VERSION, builds the DMG,
 # tags vX.Y.Z and attaches the DMG. Every installed copy polls the latest one.
 GITHUB_REPO     = "sammystech/HumanType"
-UPDATE_URL      = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# HUMANTYPE_UPDATE_URL points a test build at a fake release feed.
+UPDATE_URL      = (os.environ.get("HUMANTYPE_UPDATE_URL")
+                   or f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
 UPDATE_INTERVAL = 6 * 3600   # re-check while running; menu-bar apps run for days
 
 # HTTPS trust. The bundled OpenSSL only looks for Homebrew's cert.pem, which
@@ -558,6 +560,100 @@ HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
                | ht.kCGEventFlagMaskAlternate)
 
 
+class NotchUpdatePanel:
+    """Mac ID's update notice: a black panel whose top hides behind the notch
+    (or the menu bar on notchless screens), so it reads as dropping out of it.
+    App icon, "HumanType X is available", and Update now / Later, which call
+    updateNow: / updateLater: on the target. Never becomes key."""
+
+    W, BODY = 380, 78
+
+    def __init__(self):
+        self.panel = None
+
+    def show(self, version, target):
+        from AppKit import (NSPanel, NSScreen, NSImageView, NSFontAttributeName,
+                            NSForegroundColorAttributeName, NSAttributedString,
+                            NSWindowStyleMaskBorderless,
+                            NSWindowStyleMaskNonactivatingPanel)
+        from Quartz import CGWindowLevelForKey, kCGMainMenuWindowLevelKey
+        screens = list(NSScreen.screens())
+        screen = next((sc for sc in screens if sc.safeAreaInsets().top > 0),
+                      NSScreen.mainScreen() or screens[0])
+        top = max(screen.safeAreaInsets().top, NSStatusBar.systemStatusBar().thickness())
+        w, h = self.W, top + self.BODY
+        if self.panel is None:
+            p = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, w, h),
+                NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+                NSBackingStoreBuffered, False)
+            p.setReleasedWhenClosed_(False)
+            # Above the menu bar, which the panel's top overlaps.
+            p.setLevel_(CGWindowLevelForKey(kCGMainMenuWindowLevelKey) + 2)
+            p.setBackgroundColor_(NSColor.clearColor())
+            p.setOpaque_(False)
+            p.setHasShadow_(True)
+            p.setBecomesKeyOnlyIfNeeded_(True)
+            # canJoinAllSpaces | stationary | fullScreenAuxiliary
+            p.setCollectionBehavior_((1 << 0) | (1 << 4) | (1 << 8))
+            self.panel = p
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        root.setWantsLayer_(True)
+        layer = root.layer()
+        layer.setBackgroundColor_(NSColor.blackColor().CGColor())
+        layer.setCornerRadius_(22)
+        layer.setMaskedCorners_(1 | 2)          # bottom-left, bottom-right only
+        layer.setCornerCurve_("continuous")
+
+        icon = NSImageView.alloc().initWithFrame_(NSMakeRect(16, 21, 40, 40))
+        icon.setImage_(NSApplication.sharedApplication().applicationIconImage())
+        root.addSubview_(icon)
+
+        def label(text, y, hgt, font, alpha):
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFrame_(NSMakeRect(66, y, w - 66 - 108, hgt))
+            lbl.setFont_(font)
+            lbl.setTextColor_(NSColor.whiteColor().colorWithAlphaComponent_(alpha))
+            lbl.setLineBreakMode_(NSLineBreakByTruncatingTail)
+            root.addSubview_(lbl)
+        label(f"HumanType {version} is available", 42, 18,
+              NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold), 1.0)
+        label("A new version is ready to install.", 24, 16,
+              NSFont.systemFontOfSize_(11.5), 0.7)
+
+        def button(title, y, hgt, sel, fill, weight, alpha):
+            b = NSButton.alloc().initWithFrame_(NSMakeRect(w - 16 - 84, y, 84, hgt))
+            b.setBordered_(False)
+            b.setAttributedTitle_(NSAttributedString.alloc().initWithString_attributes_(
+                title, {NSFontAttributeName: NSFont.systemFontOfSize_weight_(12, weight),
+                        NSForegroundColorAttributeName:
+                            NSColor.whiteColor().colorWithAlphaComponent_(alpha)}))
+            b.setTarget_(target)
+            b.setAction_(sel)
+            if fill is not None:
+                b.setWantsLayer_(True)
+                b.layer().setBackgroundColor_(fill.CGColor())
+                b.layer().setCornerRadius_(hgt / 2)
+            root.addSubview_(b)
+        button("Update now", 43, 24, b"updateNow:", NSColor.controlAccentColor(),
+               NSFontWeightSemibold, 1.0)
+        button("Later", 15, 22, b"updateLater:", None, NSFontWeightMedium, 0.75)
+
+        p = self.panel
+        p.setContentView_(root)
+        f = screen.frame()
+        p.setFrame_display_(NSMakeRect(f.origin.x + f.size.width / 2 - w / 2,
+                                       f.origin.y + f.size.height - h, w, h), True)
+        p.setAlphaValue_(0.0)
+        p.orderFrontRegardless()
+        NSAnimationContext.currentContext().setDuration_(0.25)
+        p.animator().setAlphaValue_(1.0)
+
+    def hide(self):
+        if self.panel is not None:
+            self.panel.orderOut_(None)
+
+
 def binding_label(binding):
     keycode, mods = binding
     out = ""
@@ -641,7 +737,13 @@ class AppController(NSObject):
         self._install_global_tap()
 
         self._update_info = None       # filled by background update check
-        self._skipped_version = None   # "Later" on this version: don't re-ask
+        self._ready_dmg = None         # downloaded update waiting to install
+        self._ready_version = None
+        self._downloading = False
+        self._installing = False
+        self._relaunching = False      # permission relaunch: don't install on quit
+        self._update_waiting = False   # panel deferred until the typing run ends
+        self._notch = NotchUpdatePanel()
         # Check for updates quietly a few seconds after launch, then periodically.
         self._schedule(b"_checkForUpdates:", 4.0)
         if LicenseManager.is_licensed() or not LICENSING_ENABLED:
@@ -662,33 +764,92 @@ class AppController(NSObject):
         return False  # keep living in the menu bar after the window closes
 
     # ── Auto-update (GitHub Releases) ─────────────────────────────────────
+    # Same flow as Mac ID: a newer release downloads in the background, then a
+    # panel drops out of the notch with Update now / Later. Update now swaps in
+    # the new version and relaunches; Later installs it the next time HumanType
+    # quits. The panel never takes focus, so it can't steal keystrokes.
 
     def _checkForUpdates_(self, _):
         """Scheduled on the main run loop: shortly after launch, then every
-        UPDATE_INTERVAL. The network call runs on a background thread."""
-        threading.Thread(target=self._fetch_update_info, daemon=True).start()
+        UPDATE_INTERVAL. The network work runs on a background thread."""
+        threading.Thread(target=self._check_bg, args=(False,), daemon=True).start()
         self._schedule(b"_checkForUpdates:", UPDATE_INTERVAL)
 
+    def checkForUpdatesManually_(self, sender):
+        """Menu item: show a downloaded update again, or check now."""
+        if self._ready_dmg and os.path.exists(self._ready_dmg):
+            self._presentUpdate_(None)
+            return
+        self._set_status("Checking for updates…")
+        threading.Thread(target=self._check_bg, args=(True,), daemon=True).start()
+
     @objc.python_method
-    def _fetch_update_info(self):
-        """Background: fetch the latest release and compare with APP_VERSION."""
+    def _on_main(self, sel, obj=None):
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(sel, obj, False)
+
+    @objc.python_method
+    def _check_bg(self, manual):
+        """Background: find a newer release, download it, then show the panel."""
         try:
             info = fetch_latest_release()
-        except Exception:
-            return   # silent — the next scheduled check tries again
-        if info and _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
-            self._update_info = info
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_offerUpdate:", info, False)
-
-    def _offerUpdate_(self, info):
-        """Main thread: badge the UI, then ask once per version — but never
-        mid-run, where a modal alert would take the keystrokes meant for the
-        target app. The menu-bar item stays available either way."""
-        self._showUpdateBadge_(info)
-        if info.get("version") == self._skipped_version or self._typing_gen is not None:
+        except Exception as e:
+            if manual:
+                self._on_main(b"_updateCheckFailed:", str(e))
+            return   # scheduled checks stay silent; the next one tries again
+        if not info or _version_tuple(info["version"]) <= _version_tuple(APP_VERSION):
+            if manual:
+                self._on_main(b"_noUpdateFound:")
             return
-        self._promptUpdate_(info)
+        version, url = info["version"], info.get("download_url", "")
+        self._update_info = info
+        self._on_main(b"_showUpdateBadge:", info)
+        if self._ready_version != version or not os.path.exists(self._ready_dmg or ""):
+            if not url or self._downloading:
+                return
+            if manual:
+                self._on_main(b"_setStatusText:", f"Downloading HumanType {version}…")
+            self._downloading = True
+            dmg = f"/tmp/HumanType_update_{version}.dmg"
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": f"HumanType/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=60, context=TLS) as resp, \
+                        open(dmg, "wb") as fh:
+                    while chunk := resp.read(256 * 1024):
+                        fh.write(chunk)
+            except Exception as e:
+                if manual:
+                    self._on_main(b"_updateCheckFailed:", f"Download failed: {e}")
+                return
+            finally:
+                self._downloading = False
+            self._ready_dmg, self._ready_version = dmg, version
+        self._on_main(b"_presentUpdate:")
+
+    def _presentUpdate_(self, _):
+        """Main thread: drop the panel out of the notch — but never mid-run;
+        a run in progress shows it when it finishes (see _finish)."""
+        if self._typing_gen is not None:
+            self._update_waiting = True
+            return
+        self._update_waiting = False
+        self._notch.show(self._ready_version, self)
+
+    def updateNow_(self, sender):
+        self._notch.hide()
+        if self._ready_dmg and os.path.exists(self._ready_dmg):
+            self._install_update(self._ready_dmg, relaunch=True)
+
+    def updateLater_(self, sender):
+        # Installs when HumanType quits (applicationWillTerminate_); the next
+        # scheduled check shows the panel again if it's still running then.
+        self._notch.hide()
+        self._set_status(f"HumanType {self._ready_version} installs when you quit.")
+
+    def applicationWillTerminate_(self, notification):
+        if self._ready_dmg and not self._installing and not self._relaunching \
+                and os.path.exists(self._ready_dmg):
+            self._install_update(self._ready_dmg, relaunch=False)
 
     def _showUpdateBadge_(self, info):
         """Main thread: point the version label and menu item at the update."""
@@ -700,51 +861,8 @@ class AppController(NSObject):
         if getattr(self, "_update_menu_item", None) is not None:
             self._update_menu_item.setTitle_(f"Install Update {version}…")
 
-    def checkForUpdatesManually_(self, sender):
-        """Menu item — install a known update, or check now and report back."""
-        if self._update_info:
-            self._promptUpdate_(self._update_info)
-            return
-        self._set_status("Checking for updates…")
-        threading.Thread(target=self._check_manually_bg, daemon=True).start()
-
-    @objc.python_method
-    def _check_manually_bg(self):
-        try:
-            info = fetch_latest_release()
-        except Exception as e:
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_updateCheckFailed:", str(e), False)
-            return
-        if info and _version_tuple(info["version"]) > _version_tuple(APP_VERSION):
-            self._update_info = info
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_showUpdateBadge:", info, False)
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_promptUpdate:", info, False)
-        else:
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_noUpdateFound:", None, False)
-
-    def _promptUpdate_(self, info):
-        from AppKit import NSAlert, NSAlertFirstButtonReturn
-        version = info.get("version", "?")
-        notes   = info.get("release_notes", "Improvements and bug fixes.")
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_(f"HumanType {version} is available")
-        alert.setInformativeText_(
-            f"You have {APP_VERSION}. What's new:\n\n{notes}\n\n"
-            "It downloads in the background, then HumanType reopens on the new version.")
-        alert.addButtonWithTitle_("Download & Install")
-        alert.addButtonWithTitle_("Later")
-        # The prompt takes focus when it appears, so a Return meant for
-        # whatever you were typing in must not install: only a click does.
-        alert.buttons()[0].setKeyEquivalent_("")
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-        if alert.runModal() == NSAlertFirstButtonReturn:
-            self._start_update_download(info)
-        else:
-            self._skipped_version = version
+    def _setStatusText_(self, text):
+        self._set_status(text)
 
     def _noUpdateFound_(self, _):
         self._set_status(f"You're up to date (v{APP_VERSION}).")
@@ -753,55 +871,20 @@ class AppController(NSObject):
         self._set_status(f"Update check failed: {err}")
 
     @objc.python_method
-    def _start_update_download(self, info):
-        url = info.get("download_url", "")
-        if not url:
-            self._set_status("That release has no DMG attached.")
-            return
-        self._set_status("Downloading update…")
-        threading.Thread(target=self._download_update_bg,
-                         args=(url, info.get("version", "?")),
-                         daemon=True).start()
-
-    @objc.python_method
-    def _download_update_bg(self, url, version):
-        """Download the new DMG and trigger the install shim."""
-        tmp_dmg = f"/tmp/HumanType_update_{version}.dmg"
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": f"HumanType/{APP_VERSION}"})
-            with urllib.request.urlopen(req, timeout=30, context=TLS) as resp, \
-                    open(tmp_dmg, "wb") as fh:
-                total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
-                while chunk := resp.read(256 * 1024):
-                    fh.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                            b"_updateDownloadProgress:", min(100, done * 100 // total), False)
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_installUpdate:", tmp_dmg, False)
-        except Exception as e:
-            self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"_updateCheckFailed:", f"Download failed: {e}", False)
-
-    def _updateDownloadProgress_(self, pct):
-        self._set_status(f"Downloading update… {pct}%")
-
-    def _installUpdate_(self, tmp_dmg):
-        """Write a self-deleting shell shim that waits for this app to quit,
-        then mounts the DMG, swaps in the new .app, and relaunches."""
+    def _install_update(self, dmg, relaunch):
+        """Start a self-deleting shell shim that waits for this process to quit,
+        mounts the DMG, swaps in the new .app, and (optionally) relaunches."""
         from Foundation import NSBundle
+        self._installing = True
         app_path = str(NSBundle.mainBundle().bundlePath())
         # Copy beside the old bundle, then swap: ditto *over* the old bundle
         # would merge, leaving stale files inside that break its signature.
         shim = f"""\
 #!/bin/bash
 # HumanType auto-updater shim — runs after the app quits
-while pgrep -f "HumanType.app/Contents/MacOS" > /dev/null 2>&1; do sleep 0.3; done
+while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.3; done
 sleep 0.5
-MNT=$(hdiutil attach "{tmp_dmg}" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)
+MNT=$(hdiutil attach "{dmg}" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)
 if [ -z "$MNT" ]; then exit 1; fi
 NEW="$MNT/HumanType.app"
 APP="{app_path}"
@@ -812,9 +895,8 @@ if codesign --verify --deep --strict "$NEW" 2>/dev/null; then
 fi
 hdiutil detach "$MNT" -force -quiet 2>/dev/null
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null
-rm -f "{tmp_dmg}"
-sleep 0.5
-open "$APP"
+rm -f "{dmg}"
+{'sleep 0.5; open "$APP"' if relaunch else ''}
 rm -- "$0"   # self-delete
 """
         shim_path = "/tmp/humantype_updater.sh"
@@ -822,10 +904,11 @@ rm -- "$0"   # self-delete
             fh.write(shim)
         os.chmod(shim_path, 0o755)
         import subprocess
-        subprocess.Popen(["/bin/bash", shim_path])
-        self._set_status("Installing update — relaunching shortly…")
-        # Give the shim a moment to start waiting, then quit this process
-        self._schedule(b"end:", 1.2)
+        subprocess.Popen(["/bin/bash", shim_path], start_new_session=True)
+        if relaunch:
+            self._set_status("Installing update — relaunching shortly…")
+            # Give the shim a moment to start waiting, then quit this process
+            self._schedule(b"end:", 1.2)
 
     # ── UI construction ───────────────────────────────────────────────────
 
@@ -1755,6 +1838,7 @@ rm -- "$0"   # self-delete
         """Quit and relaunch a fresh instance, so a just-granted Accessibility
         permission actually takes effect (macOS applies it only to new launches)."""
         self._save_draft()
+        self._relaunching = True
         try:
             d = NSUserDefaults.standardUserDefaults()
             d.setBool_forKey_(True, "relaunched_for_perm")
@@ -1814,9 +1898,11 @@ rm -- "$0"   # self-delete
             # ⌘/⌃/⌥ for a hotkey mid-typing, the next typed letter would land as
             # ⌘+letter (close tab, select all…). Strip those bits; Shift stays,
             # since that's how capitals are typed.
-            if CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != 0:
+            pid = CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID)
+            if pid != 0:
+                # Only HumanType's own: other apps' shortcuts (Utter's ⌘V paste) keep ⌘.
                 flags = int(CGEventGetFlags(event))
-                if flags & HOLD_MODS:
+                if pid == os.getpid() and flags & HOLD_MODS:
                     CGEventSetFlags(event, flags & ~HOLD_MODS)
                 return event
             if etype != kCGEventKeyDown:
@@ -2006,6 +2092,8 @@ rm -- "$0"   # self-delete
         self._asked_ax = False
         self._set_running(False)
         self._set_status("Done." if finished else "Stopped.")
+        if self._update_waiting:
+            self._presentUpdate_(None)
 
     def togglePause_(self, sender):
         if self.state is None or self._typing_gen is None:
