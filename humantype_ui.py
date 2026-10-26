@@ -13,6 +13,7 @@ an app the new design only when its main executable links the macOS 26+ SDK;
 build_humantype.sh checks that for the bundle."""
 
 import json
+import math
 import os
 import ssl
 import sys
@@ -561,30 +562,92 @@ HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
 
 
 class NotchUpdatePanel:
-    """Mac ID's update notice: a black panel whose top hides behind the notch
-    (or the menu bar on notchless screens), so it reads as dropping out of it.
-    App icon, "HumanType X is available", and Update now / Later, which call
-    updateNow: / updateLater: on the target. Never becomes key."""
+    """Mac ID's update notice: a black panel that grows out of the notch (or a
+    small pill under the menu bar on notchless screens) on Mac ID's open spring,
+    then fades its contents in: app icon, "HumanType X is available", and
+    Update now / Later, which call updateNow: / updateLater: on the target.
+    Closing runs the reverse on a no-bounce spring. Never becomes key."""
 
     W, BODY = 380, 78
+    # Mac ID's NotchGeometry springs (SwiftUI response / dampingFraction).
+    OPEN_SPRING, CLOSE_SPRING = (0.45, 0.7), (0.45, 1.0)
 
     def __init__(self):
         self.panel = None
+        self.body = None        # the black shape (a CALayer we animate)
+        self.content = None     # icon, labels, buttons
+        self.closed = None      # (rect, radius) the shape grows from
+
+    @staticmethod
+    def _spring(key, src, dst, response, damping):
+        from Quartz import CASpringAnimation
+        anim = CASpringAnimation.animationWithKeyPath_(key)
+        # SwiftUI's spring(response:dampingFraction:) as a unit-mass spring.
+        stiffness = (2 * math.pi / response) ** 2
+        anim.setMass_(1.0)
+        anim.setStiffness_(stiffness)
+        anim.setDamping_(4 * math.pi * damping / response)
+        anim.setFromValue_(src)
+        anim.setToValue_(dst)
+        anim.setDuration_(anim.settlingDuration())
+        return anim
+
+    def _morph(self, rect, radius, spring):
+        """Spring the shape to rect/radius from wherever it is right now."""
+        from Quartz import CATransaction
+        body = self.body
+        pres = body.presentationLayer() or body
+        frm_b, frm_p, frm_r = pres.bounds(), pres.position(), pres.cornerRadius()
+        to_b = ((0, 0), (rect.size.width, rect.size.height))
+        to_p = (rect.origin.x + rect.size.width / 2, rect.origin.y + rect.size.height / 2)
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        body.setBounds_(to_b)
+        body.setPosition_(to_p)
+        body.setCornerRadius_(radius)
+        CATransaction.commit()
+        if reduce_motion():
+            return 0.0
+        dur = 0.0
+        for key, src, dst in (("bounds", NSValue.valueWithRect_(frm_b), NSValue.valueWithRect_(to_b)),
+                              ("position", NSValue.valueWithPoint_(frm_p), NSValue.valueWithPoint_(to_p)),
+                              ("cornerRadius", frm_r, radius)):
+            anim = self._spring(key, src, dst, *spring)
+            body.addAnimation_forKey_(anim, key)
+            dur = max(dur, anim.duration())
+        return dur
+
+    def _fade_content(self, alpha, duration, delay=0.0):
+        def run(ctx):
+            ctx.setDuration_(0.0 if reduce_motion() else duration)
+            self.content.animator().setAlphaValue_(alpha)
+        if delay and not reduce_motion():
+            self._after(delay, lambda: NSAnimationContext.runAnimationGroup_(run))
+        else:
+            NSAnimationContext.runAnimationGroup_(run)
+
+    @staticmethod
+    def _after(delay, fn):
+        from Foundation import NSTimer
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(delay, False, lambda t: fn())
 
     def show(self, version, target):
         from AppKit import (NSPanel, NSScreen, NSImageView, NSFontAttributeName,
                             NSForegroundColorAttributeName, NSAttributedString,
                             NSWindowStyleMaskBorderless,
                             NSWindowStyleMaskNonactivatingPanel)
-        from Quartz import CGWindowLevelForKey, kCGMainMenuWindowLevelKey
+        from Quartz import CALayer, CGWindowLevelForKey, kCGMainMenuWindowLevelKey
         screens = list(NSScreen.screens())
         screen = next((sc for sc in screens if sc.safeAreaInsets().top > 0),
                       NSScreen.mainScreen() or screens[0])
-        top = max(screen.safeAreaInsets().top, NSStatusBar.systemStatusBar().thickness())
+        notch_h = screen.safeAreaInsets().top
+        top = max(notch_h, NSStatusBar.systemStatusBar().thickness())
         w, h = self.W, top + self.BODY
+        pad = 40                # room for the shadow and the spring's overshoot
+        win_w, win_h = w + 2 * pad, h + pad
         if self.panel is None:
             p = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, w, h),
+                NSMakeRect(0, 0, win_w, win_h),
                 NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
                 NSBackingStoreBuffered, False)
             p.setReleasedWhenClosed_(False)
@@ -592,22 +655,44 @@ class NotchUpdatePanel:
             p.setLevel_(CGWindowLevelForKey(kCGMainMenuWindowLevelKey) + 2)
             p.setBackgroundColor_(NSColor.clearColor())
             p.setOpaque_(False)
-            p.setHasShadow_(True)
+            p.setHasShadow_(False)   # the shape casts its own, so it follows the spring
             p.setBecomesKeyOnlyIfNeeded_(True)
             # canJoinAllSpaces | stationary | fullScreenAuxiliary
             p.setCollectionBehavior_((1 << 0) | (1 << 4) | (1 << 8))
             self.panel = p
-        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
-        root.setWantsLayer_(True)
-        layer = root.layer()
-        layer.setBackgroundColor_(NSColor.blackColor().CGColor())
-        layer.setCornerRadius_(22)
-        layer.setMaskedCorners_(1 | 2)          # bottom-left, bottom-right only
-        layer.setCornerCurve_("continuous")
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, win_w, win_h))
+        # The shape lives on its own subview with no subviews, so AppKit never
+        # re-lays out the layer we're springing.
+        stage = NSView.alloc().initWithFrame_(root.bounds())
+        stage.setWantsLayer_(True)
+        root.addSubview_(stage)
+        body = CALayer.layer()
+        body.setBackgroundColor_(NSColor.blackColor().CGColor())
+        body.setMaskedCorners_(1 | 2)          # bottom-left, bottom-right only
+        body.setCornerCurve_("continuous")
+        body.setShadowOpacity_(0.35)
+        body.setShadowRadius_(14)
+        body.setShadowOffset_((0, -4))
+        stage.layer().addSublayer_(body)
+        self.body = body
+
+        # Where it grows from: the physical notch, else a small pill.
+        left, right = screen.auxiliaryTopLeftArea(), screen.auxiliaryTopRightArea()
+        notch_w = screen.frame().size.width - left.size.width - right.size.width \
+            if notch_h > 0 else 0
+        cw = notch_w if 0 < notch_w < w else 120
+        ch = notch_h if notch_h > 0 else top
+        self.closed = (NSMakeRect(pad + (w - cw) / 2, win_h - ch, cw, ch), 10.0)
+        self.open = (NSMakeRect(pad, win_h - h, w, h), 22.0)
+
+        content = NSView.alloc().initWithFrame_(NSMakeRect(pad, win_h - h, w, h))
+        content.setAlphaValue_(0.0)
+        root.addSubview_(content)
+        self.content = content
 
         icon = NSImageView.alloc().initWithFrame_(NSMakeRect(16, 21, 40, 40))
         icon.setImage_(NSApplication.sharedApplication().applicationIconImage())
-        root.addSubview_(icon)
+        content.addSubview_(icon)
 
         def label(text, y, hgt, font, alpha):
             lbl = NSTextField.labelWithString_(text)
@@ -615,7 +700,7 @@ class NotchUpdatePanel:
             lbl.setFont_(font)
             lbl.setTextColor_(NSColor.whiteColor().colorWithAlphaComponent_(alpha))
             lbl.setLineBreakMode_(NSLineBreakByTruncatingTail)
-            root.addSubview_(lbl)
+            content.addSubview_(lbl)
         label(f"HumanType {version} is available", 42, 18,
               NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold), 1.0)
         label("A new version is ready to install.", 24, 16,
@@ -634,7 +719,7 @@ class NotchUpdatePanel:
                 b.setWantsLayer_(True)
                 b.layer().setBackgroundColor_(fill.CGColor())
                 b.layer().setCornerRadius_(hgt / 2)
-            root.addSubview_(b)
+            content.addSubview_(b)
         button("Update now", 43, 24, b"updateNow:", NSColor.controlAccentColor(),
                NSFontWeightSemibold, 1.0)
         button("Later", 15, 22, b"updateLater:", None, NSFontWeightMedium, 0.75)
@@ -642,16 +727,28 @@ class NotchUpdatePanel:
         p = self.panel
         p.setContentView_(root)
         f = screen.frame()
-        p.setFrame_display_(NSMakeRect(f.origin.x + f.size.width / 2 - w / 2,
-                                       f.origin.y + f.size.height - h, w, h), True)
-        p.setAlphaValue_(0.0)
+        p.setFrame_display_(NSMakeRect(f.origin.x + f.size.width / 2 - win_w / 2,
+                                       f.origin.y + f.size.height - win_h, win_w, win_h), True)
+        # Start tucked into the notch, then spring open and bring the contents in
+        # once the shape is most of the way out.
+        rect, radius = self.closed
+        self.body.setBounds_(((0, 0), (rect.size.width, rect.size.height)))
+        self.body.setPosition_((rect.origin.x + rect.size.width / 2,
+                                rect.origin.y + rect.size.height / 2))
+        self.body.setCornerRadius_(radius)
+        p.setAlphaValue_(1.0)
         p.orderFrontRegardless()
-        NSAnimationContext.currentContext().setDuration_(0.25)
-        p.animator().setAlphaValue_(1.0)
+        self._morph(*self.open, self.OPEN_SPRING)
+        self._fade_content(1.0, 0.2, delay=0.12)
 
     def hide(self):
-        if self.panel is not None:
-            self.panel.orderOut_(None)
+        if self.panel is None or not self.panel.isVisible():
+            return
+        p = self.panel
+        self._fade_content(0.0, 0.12)
+        dur = self._morph(*self.closed, self.CLOSE_SPRING)
+        # Once it's back inside the notch, take the window away.
+        self._after(max(dur, 0.12), lambda: p.orderOut_(None))
 
 
 def binding_label(binding):
