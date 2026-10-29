@@ -804,6 +804,7 @@ class AppController(NSObject):
         self._realism_name      = d.stringForKey_("ht_realism") or "Natural"
         if self._realism_name not in REALISM: self._realism_name = "Natural"
         self._auto_paste        = bool(d.boolForKey_("ht_auto_paste"))
+        self._type_on_paste     = bool(d.boolForKey_("ht_type_on_paste"))
         self._strip_fmt         = bool(d.boolForKey_("ht_strip_fmt"))
         # Text progress tracking
         self._total_steps = 0
@@ -1065,6 +1066,7 @@ rm -- "$0"   # self-delete
             it.setTarget_(self)
             menu.addItem_(it)
             return it
+            return it
 
         item("Show HumanType", b"showWindow:")
         menu.addItem_(NSMenuItem.separatorItem())
@@ -1094,6 +1096,8 @@ rm -- "$0"   # self-delete
             "Lock keyboard", b"toggleLock:", "")
         self.lock_menu_item.setTarget_(self)
         menu.addItem_(self.lock_menu_item)
+        self.type_paste_menu_item = item("Type ⌘V Pastes", b"toggleTypeOnPaste:")
+        self.type_paste_menu_item.setState_(1 if self._type_on_paste else 0)
         menu.addItem_(NSMenuItem.separatorItem())
         if LICENSING_ENABLED:
             item("Enter License Key", b"showLicense:")
@@ -1489,13 +1493,16 @@ rm -- "$0"   # self-delete
             c, row(h, 0), "Typo rate", 0.0, 0.15, override,
             _typo_label, b"settingsTypoChanged:")
 
-        c, h = card("Behaviour", 2)
+        c, h = card("Behaviour", 3)
         self._st_auto_paste = switch_row(
             c, row(h, 0), "Auto-paste clipboard text on open",
             self._auto_paste, b"settingsAutoPasteToggled:")
         self._st_strip_fmt = switch_row(
             c, row(h, 1), "Flatten line breaks and extra spaces",
             self._strip_fmt, b"settingsStripFmtToggled:")
+        self._st_type_on_paste = switch_row(
+            c, row(h, 2), "Type out ⌘V pastes instead of pasting",
+            self._type_on_paste, b"toggleTypeOnPaste:")
 
         c, h = card("Shortcuts", 4)
         self.start_stop_rec = shortcut_row(
@@ -1617,6 +1624,16 @@ rm -- "$0"   # self-delete
         self._auto_paste = bool(sender.state())
         NSUserDefaults.standardUserDefaults().setBool_forKey_(
             self._auto_paste, "ht_auto_paste")
+
+    def toggleTypeOnPaste_(self, sender):
+        """Settings switch and menu item: one state, both controls in sync."""
+        self._type_on_paste = not self._type_on_paste
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(
+            self._type_on_paste, "ht_type_on_paste")
+        self._st_type_on_paste.setState_(1 if self._type_on_paste else 0)
+        self.type_paste_menu_item.setState_(1 if self._type_on_paste else 0)
+        self._set_status("⌘V now types out what you paste." if self._type_on_paste
+                         else "⌘V pastes normally again.")
 
     def settingsStripFmtToggled_(self, sender):
         self._strip_fmt = bool(sender.state())
@@ -1853,6 +1870,25 @@ rm -- "$0"   # self-delete
                 self._set_status("Still not detected — remove HumanType from Accessibility, reopen, re-add.")
             return
 
+        self._run_typing(text, self._countdown_secs)
+        self._set_status(f"Click your target box — typing starts in {self._countdown_secs}s…")
+        self.window.orderOut_(None)  # get out of the way so the target gets focus
+
+    def typePasted_(self, text):
+        """⌘V with "Type ⌘V Pastes" on: the target already has focus (that's
+        where you pressed ⌘V), so type the clipboard text straight away."""
+        if self._typing_gen is not None:
+            return
+        self._cancel_typing_timers()
+        text = str(text)
+        if self._strip_fmt:
+            text = " ".join(text.split())
+        self._run_typing(text, 0)
+        self._set_status("Typing what you pasted…")
+
+    @objc.python_method
+    def _run_typing(self, text, countdown):
+        """Start a run: countdown seconds first (0 = start right away)."""
         wpm = self._current_wpm
         mistake_rate = self._typo_rate()
 
@@ -1863,7 +1899,7 @@ rm -- "$0"   # self-delete
         self.typist = ht.Typist(
             ht._CTypesKeyboard(), self.state, 60.0 / (wpm * 5.0), mistake_rate)
         self._typing_gen = self.typist.steps(text)
-        self._countdown_left = self._countdown_secs
+        self._countdown_left = countdown
         # Progress tracking: count how many generator steps the text would take
         # (rough: len(text) * 1.05 for typo overhead)
         self._total_steps = max(1, int(len(text) * 1.05))
@@ -1875,9 +1911,12 @@ rm -- "$0"   # self-delete
         # keystroke cadence lurch. Opt out for the length of the run.
         self._activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
             NSActivityUserInitiated | NSActivityLatencyCritical, "Typing text")
-        self._set_status(f"Click your target box — typing starts in {self._countdown_secs}s…")
-        self.window.orderOut_(None)  # get out of the way so the target gets focus
-        self._schedule(b"countdownTick:", 1.0)
+        if countdown > 0:
+            self._schedule(b"countdownTick:", 1.0)
+        else:
+            # A beat so the ⌘V keys are let go of; held ⌘ is stripped from our
+            # keys by the tap anyway.
+            self._schedule(b"typeStep:", 0.15)
 
     @objc.python_method
     def _cancel_typing_timers(self):
@@ -1983,6 +2022,10 @@ rm -- "$0"   # self-delete
         HOLD_MODS = (kCGEventFlagMaskCommand | kCGEventFlagMaskControl
                      | kCGEventFlagMaskAlternate)
 
+        # ⌘ + whichever key types "v" on this keyboard layout (9 on QWERTY).
+        paste_key = (ht._CTypesKeyboard()._char_map.get("v", (9, False))[0],
+                     ht.kCGEventFlagMaskCommand)
+
         def tap_callback(proxy, etype, event, refcon):
             if etype in (kCGEventTapDisabledByTimeout,
                          kCGEventTapDisabledByUserInput):
@@ -2013,6 +2056,20 @@ rm -- "$0"   # self-delete
             mods = int(CGEventGetFlags(event)) & ht.MOD_MASK
             key = (keycode, mods)
             typing = self._typing_gen is not None and self.state is not None
+
+            # Type ⌘V Pastes: swallow a physical ⌘V aimed at another app and type
+            # the clipboard text instead. HumanType's own window pastes normally,
+            # and so does anything that isn't text (images, files).
+            if (self._type_on_paste and key == paste_key and not typing
+                    and not NSApplication.sharedApplication().isActive()):
+                if autorepeat:
+                    return None
+                pasted = NSPasteboard.generalPasteboard().stringForType_(
+                    NSPasteboardTypeString)
+                if pasted and str(pasted).strip():
+                    self.performSelector_withObject_afterDelay_inModes_(
+                        b"typePasted:", pasted, 0.0, [NSRunLoopCommonModes])
+                    return None
 
             if not autorepeat:
                 # Lock toggle — always active, checked first so it works even
