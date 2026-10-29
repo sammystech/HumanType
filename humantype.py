@@ -59,6 +59,7 @@ KEY_BACKTICK = 50   # the ` / ~ key, just left of "1"
 KEY_Q = 12
 KEY_S = 1
 KEY_L = 37
+KEY_V = 9
 
 # The modifier bits we care about. CGEvent flag masks share the same bit values
 # as AppKit's NSEventModifierFlags, so the UI's key recorder can hand us masks
@@ -73,6 +74,8 @@ DEFAULT_STOP_BINDING = (KEY_Q, kCGEventFlagMaskControl | kCGEventFlagMaskAlterna
 DEFAULT_START_STOP_BINDING = (KEY_S, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
 # Ctrl+Alt+L — locks/unlocks the physical keyboard (auto-typed keys still flow).
 DEFAULT_LOCK_BINDING = (KEY_L, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
+# Ctrl+Alt+V — types out the clipboard text into the focused app (⌘V still pastes).
+DEFAULT_TYPE_PASTE_BINDING = (KEY_V, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
 
 
 # Rough QWERTY neighbors, used to make simulated typos look plausible.

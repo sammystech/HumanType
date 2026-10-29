@@ -556,7 +556,7 @@ KEYNAMES = {
 
 
 # Bindings that act in every app even when idle, and the modifiers they need.
-ALWAYS_ON = ("start_stop", "lock")
+ALWAYS_ON = ("start_stop", "lock", "type_paste")
 HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
                | ht.kCGEventFlagMaskAlternate)
 
@@ -795,6 +795,8 @@ class AppController(NSObject):
         self.start_stop_binding = self._load_binding(
             d, "start_stop", ht.DEFAULT_START_STOP_BINDING)
         self.lock_binding = self._load_binding(d, "lock", ht.DEFAULT_LOCK_BINDING)
+        self.type_paste_binding = self._load_binding(
+            d, "type_paste", ht.DEFAULT_TYPE_PASTE_BINDING)
         self._kbd_locked = False
         # Settings (loaded fresh from defaults each time, saved on change)
         self._current_wpm       = int(d.integerForKey_("ht_wpm") or 55)
@@ -804,7 +806,6 @@ class AppController(NSObject):
         self._realism_name      = d.stringForKey_("ht_realism") or "Natural"
         if self._realism_name not in REALISM: self._realism_name = "Natural"
         self._auto_paste        = bool(d.boolForKey_("ht_auto_paste"))
-        self._type_on_paste     = bool(d.boolForKey_("ht_type_on_paste"))
         self._strip_fmt         = bool(d.boolForKey_("ht_strip_fmt"))
         # Text progress tracking
         self._total_steps = 0
@@ -1096,8 +1097,6 @@ rm -- "$0"   # self-delete
             "Lock keyboard", b"toggleLock:", "")
         self.lock_menu_item.setTarget_(self)
         menu.addItem_(self.lock_menu_item)
-        self.type_paste_menu_item = item("Type ⌘V Pastes", b"toggleTypeOnPaste:")
-        self.type_paste_menu_item.setState_(1 if self._type_on_paste else 0)
         menu.addItem_(NSMenuItem.separatorItem())
         if LICENSING_ENABLED:
             item("Enter License Key", b"showLicense:")
@@ -1493,18 +1492,15 @@ rm -- "$0"   # self-delete
             c, row(h, 0), "Typo rate", 0.0, 0.15, override,
             _typo_label, b"settingsTypoChanged:")
 
-        c, h = card("Behaviour", 3)
+        c, h = card("Behaviour", 2)
         self._st_auto_paste = switch_row(
             c, row(h, 0), "Auto-paste clipboard text on open",
             self._auto_paste, b"settingsAutoPasteToggled:")
         self._st_strip_fmt = switch_row(
             c, row(h, 1), "Flatten line breaks and extra spaces",
             self._strip_fmt, b"settingsStripFmtToggled:")
-        self._st_type_on_paste = switch_row(
-            c, row(h, 2), "Type out ⌘V pastes instead of pasting",
-            self._type_on_paste, b"toggleTypeOnPaste:")
 
-        c, h = card("Shortcuts", 4)
+        c, h = card("Shortcuts", 5)
         self.start_stop_rec = shortcut_row(
             c, row(h, 0), "Start / Stop", self.start_stop_binding, b"recordStartStop:")
         self.pause_rec = shortcut_row(
@@ -1513,6 +1509,9 @@ rm -- "$0"   # self-delete
             c, row(h, 2), "Stop", self.stop_binding, b"recordStop:")
         self.lock_rec = shortcut_row(
             c, row(h, 3), "Lock keyboard", self.lock_binding, b"recordLock:")
+        self.type_paste_rec = shortcut_row(
+            c, row(h, 4), "Type clipboard", self.type_paste_binding,
+            b"recordTypePaste:")
 
         self._version_lbl = self._label(
             f"HumanType {APP_VERSION}", NSMakeRect(M, 18, cw, 16), size=11,
@@ -1624,16 +1623,6 @@ rm -- "$0"   # self-delete
         self._auto_paste = bool(sender.state())
         NSUserDefaults.standardUserDefaults().setBool_forKey_(
             self._auto_paste, "ht_auto_paste")
-
-    def toggleTypeOnPaste_(self, sender):
-        """Settings switch and menu item: one state, both controls in sync."""
-        self._type_on_paste = not self._type_on_paste
-        NSUserDefaults.standardUserDefaults().setBool_forKey_(
-            self._type_on_paste, "ht_type_on_paste")
-        self._st_type_on_paste.setState_(1 if self._type_on_paste else 0)
-        self.type_paste_menu_item.setState_(1 if self._type_on_paste else 0)
-        self._set_status("⌘V now types out what you paste." if self._type_on_paste
-                         else "⌘V pastes normally again.")
 
     def settingsStripFmtToggled_(self, sender):
         self._strip_fmt = bool(sender.state())
@@ -1875,8 +1864,8 @@ rm -- "$0"   # self-delete
         self.window.orderOut_(None)  # get out of the way so the target gets focus
 
     def typePasted_(self, text):
-        """⌘V with "Type ⌘V Pastes" on: the target already has focus (that's
-        where you pressed ⌘V), so type the clipboard text straight away."""
+        """Type-clipboard shortcut: the target already has focus (that's where
+        you pressed it), so type the clipboard text straight away."""
         if self._typing_gen is not None:
             return
         self._cancel_typing_timers()
@@ -1914,8 +1903,8 @@ rm -- "$0"   # self-delete
         if countdown > 0:
             self._schedule(b"countdownTick:", 1.0)
         else:
-            # A beat so the ⌘V keys are let go of; held ⌘ is stripped from our
-            # keys by the tap anyway.
+            # A beat so the shortcut's keys are let go of; held ⌘/⌃/⌥ is
+            # stripped from our keys by the tap anyway.
             self._schedule(b"typeStep:", 0.15)
 
     @objc.python_method
@@ -2022,10 +2011,6 @@ rm -- "$0"   # self-delete
         HOLD_MODS = (kCGEventFlagMaskCommand | kCGEventFlagMaskControl
                      | kCGEventFlagMaskAlternate)
 
-        # ⌘ + whichever key types "v" on this keyboard layout (9 on QWERTY).
-        paste_key = (ht._CTypesKeyboard()._char_map.get("v", (9, False))[0],
-                     ht.kCGEventFlagMaskCommand)
-
         def tap_callback(proxy, etype, event, refcon):
             if etype in (kCGEventTapDisabledByTimeout,
                          kCGEventTapDisabledByUserInput):
@@ -2057,10 +2042,10 @@ rm -- "$0"   # self-delete
             key = (keycode, mods)
             typing = self._typing_gen is not None and self.state is not None
 
-            # Type ⌘V Pastes: swallow a physical ⌘V aimed at another app and type
-            # the clipboard text instead. HumanType's own window pastes normally,
-            # and so does anything that isn't text (images, files).
-            if (self._type_on_paste and key == paste_key and not typing
+            # Type clipboard: in another app, type the clipboard text instead of
+            # pasting it (⌘V is untouched). In HumanType's own window, or when the
+            # clipboard isn't text (images, files), the keys pass through.
+            if (key == self.type_paste_binding and not typing
                     and not NSApplication.sharedApplication().isActive()):
                 if autorepeat:
                     return None
@@ -2281,10 +2266,14 @@ rm -- "$0"   # self-delete
     def recordLock_(self, sender):
         self._record("lock", self.lock_rec)
 
+    def recordTypePaste_(self, sender):
+        self._record("type_paste", self.type_paste_rec)
+
     @objc.python_method
     def _bindings(self):
         return {"start_stop": self.start_stop_binding, "pause": self.pause_binding,
-                "stop": self.stop_binding, "lock": self.lock_binding}
+                "stop": self.stop_binding, "lock": self.lock_binding,
+                "type_paste": self.type_paste_binding}
 
     @objc.python_method
     def _record(self, which, button):
@@ -2336,6 +2325,8 @@ rm -- "$0"   # self-delete
                 self.stop_binding = binding
             elif which == "lock":
                 self.lock_binding = binding
+            elif which == "type_paste":
+                self.type_paste_binding = binding
             else:
                 self.start_stop_binding = binding
             self._save_binding(which, binding)
