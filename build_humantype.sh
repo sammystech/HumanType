@@ -57,7 +57,10 @@ SIGN_ID="${SIGN_ID:-$(echo "$IDENTITIES" | awk '/Developer ID Application/{print
 SIGN_ID="${SIGN_ID:-$(echo "$IDENTITIES" | awk '/Apple Development/{print $2; exit}')}"
 SIGN_ID="${SIGN_ID:--}"
 SIGN_OPTS=(--options runtime)
-[ "$SIGN_ID" != "-" ] && SIGN_OPTS+=(--timestamp)
+# TS_URL: a timestamp server to use instead of Apple's default (release.sh sets
+# it to the local relay in tools/tsrelay.py).
+TS_OPT="--timestamp${TS_URL:+=$TS_URL}"
+[ "$SIGN_ID" != "-" ] && SIGN_OPTS+=("$TS_OPT")
 echo "==> Code signing with identity: $SIGN_ID"
 codesign --force --deep "${SIGN_OPTS[@]}" --sign "$SIGN_ID" "$APP"
 codesign --verify --deep --strict "$APP" && echo "    signature OK"
@@ -68,13 +71,13 @@ echo "==> Verifying the bundled binary (main-thread typing path)"
 
 if [ "${NOTARIZE:-0}" = 1 ]; then
   tools/notarize.sh "$APP"
-  "$EXE" --selftest          # Xcode re-signed it: check the copy that ships
+  "$EXE" --selftest          # check the stapled copy that ships
 fi
 
 echo "==> Building drag-to-install DMG"
 "$VENV/bin/python" tools/make_dmg_background.py
 "$VENV/bin/dmgbuild" -s dmg_settings.py -D app="$APP" "HumanType" "$DMG"
-[ "$SIGN_ID" != "-" ] && codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+[ "$SIGN_ID" != "-" ] && codesign --force "$TS_OPT" --sign "$SIGN_ID" "$DMG"
 # Run the in-app updater's own gate on the app inside the DMG: installed copies
 # refuse any update whose bundle fails this, so a DMG that fails it strands them.
 MNT=$(hdiutil attach "$DMG" -nobrowse -readonly 2>/dev/null | grep -o '/Volumes/.*' | head -1)

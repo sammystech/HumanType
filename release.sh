@@ -31,7 +31,14 @@ echo "==> $CURRENT -> $VERSION"
 sed -i '' "s/^APP_VERSION = \".*\"/APP_VERSION = \"$VERSION\"/" humantype_ui.py
 TRAPZERR() { git checkout -- humantype_ui.py; echo "!! Release failed; version bump reverted."; }
 
-NOTARIZE=1 ./build_humantype.sh
+# Since macOS 27.2, codesign's request to timestamp.apple.com is forced onto HTTPS,
+# which that server doesn't serve ("The timestamp service is not available").
+# A local plain-HTTP relay gets the timestamp through.
+python3 tools/tsrelay.py 8099 & RELAY_PID=$!
+trap 'kill $RELAY_PID 2>/dev/null || true' EXIT
+sleep 0.5
+
+TS_URL=http://127.0.0.1:8099/ts01 NOTARIZE=1 ./build_humantype.sh
 
 git commit -q -am "Release v$VERSION"
 git tag -a "v$VERSION" -m "HumanType $VERSION"

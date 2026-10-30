@@ -56,6 +56,29 @@ cat > "$WORK/ExportOptions.plist" <<PLIST
 </dict></plist>
 PLIST
 
+# Preferred: notarytool with the team's App Store Connect API key. It submits the
+# app exactly as signed, so the relayed timestamp survives. Xcode's export
+# re-signs with Apple's default timestamp URL, which fails on macOS 27.2+.
+ASC_KEY="${ASC_KEY:-$HOME/Downloads/AuthKey_TU74H5XWBG.p8}"
+ASC_KEY_ID="${ASC_KEY_ID:-TU74H5XWBG}"
+ASC_ISSUER="${ASC_ISSUER:-cd5276c0-2ef1-42e4-af22-4e679a6c9145}"
+if [ -f "$ASC_KEY" ]; then
+    echo "==> Submitting $VERSION to Apple for notarization (notarytool, API key $ASC_KEY_ID)"
+    ditto -c -k --keepParent "$APP" "$WORK/HumanType.zip"
+    xcrun notarytool submit "$WORK/HumanType.zip" --key "$ASC_KEY" --key-id "$ASC_KEY_ID" \
+        --issuer "$ASC_ISSUER" --wait --timeout "${WAIT_MIN}m" > "$WORK/notarize.log" 2>&1 || true
+    cat "$WORK/notarize.log" | grep -E "id:|status:" | tail -2
+    grep -q "status: Accepted" "$WORK/notarize.log" \
+        || die "Not accepted. Log: $WORK/notarize.log (details: xcrun notarytool log <id> --key ...)"
+    xcrun stapler staple "$APP" >/dev/null || die "Stapling failed."
+    xcrun stapler validate "$APP" >/dev/null 2>&1 || die "No notarization ticket stapled to the app."
+    ASSESS=$(spctl -a -t exec -vv "$APP" 2>&1 || true)
+    echo "$ASSESS" | grep -q "source=Notarized Developer ID" \
+        || { echo "$ASSESS"; die "Gatekeeper doesn't accept this as a notarized Developer ID app."; }
+    echo "    Gatekeeper: accepted (Notarized Developer ID), ticket stapled"
+    exit 0
+fi
+
 echo "==> Submitting $VERSION to Apple for notarization (via Xcode's account)"
 xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportOptionsPlist "$WORK/ExportOptions.plist" \
     -exportPath "$WORK/upload-receipt" -allowProvisioningUpdates > "$WORK/export.log" 2>&1 \
