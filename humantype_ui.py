@@ -556,7 +556,9 @@ KEYNAMES = {
 
 
 # Bindings that act in every app even when idle, and the modifiers they need.
-ALWAYS_ON = ("start_stop", "lock", "type_paste")
+# Lock isn't here: a bare lock key (Tab) is fine because it only acts during a
+# run or while locked (see _lock_live), so it types normally the rest of the time.
+ALWAYS_ON = ("start_stop", "type_paste")
 HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
                | ht.kCGEventFlagMaskAlternate)
 
@@ -1868,6 +1870,10 @@ rm -- "$0"   # self-delete
         you pressed it), so type the clipboard text straight away."""
         if self._typing_gen is not None:
             return
+        if not self._is_trusted():
+            self._set_status("Turn on HumanType in Accessibility, then try again.")
+            self._open_accessibility_settings()
+            return
         self._cancel_typing_timers()
         text = str(text)
         if self._strip_fmt:
@@ -2059,7 +2065,7 @@ rm -- "$0"   # self-delete
             if not autorepeat:
                 # Lock toggle — always active, checked first so it works even
                 # while the keyboard is locked.
-                if key == self.lock_binding:
+                if key == self.lock_binding and self._lock_live():
                     self._kbd_locked = not self._kbd_locked
                     self.performSelector_withObject_afterDelay_inModes_(
                         b"syncLockUI:", None, 0.0, [NSRunLoopCommonModes])
@@ -2086,7 +2092,8 @@ rm -- "$0"   # self-delete
             else:
                 # Autorepeat from HOLDING a hotkey: don't re-fire the action, but
                 # still swallow the repeats so they can't leak into the page.
-                if key in (self.lock_binding, self.start_stop_binding):
+                if key == self.start_stop_binding or (
+                        key == self.lock_binding and self._lock_live()):
                     return None
                 if typing and key in (self.pause_binding, self.stop_binding):
                     return None
@@ -2262,6 +2269,14 @@ rm -- "$0"   # self-delete
 
     def recordStop_(self, sender):
         self._record("stop", self.stop_rec)
+
+    @objc.python_method
+    def _lock_live(self):
+        """The lock key works in every app when it has ⌘/⌃/⌥. A bare key (Tab)
+        only acts during a run (countdown included) or while locked, so it
+        stays an ordinary key the rest of the time."""
+        return bool(self.lock_binding[1] & HOTKEY_MODS
+                    or self._typing_gen is not None or self._kbd_locked)
 
     def recordLock_(self, sender):
         self._record("lock", self.lock_rec)
