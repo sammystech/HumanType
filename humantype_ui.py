@@ -1109,8 +1109,9 @@ class Onboarding(NSObject):
          "Everything starts with the text box. Paste what you want typed. "
          "There's a sample in it already, so you can practise with that."),
         ("start", "play.fill", "Start typing",
-         "Press {start_stop} to start. Normally you'd click into your document "
-         "first; here it types into the practice box below."),
+         "Press {start_stop} to start. For real, it waits {countdown} seconds first so you "
+         "can click into your document: if nothing happens right away, just wait. "
+         "Here it starts straight away."),
         ("pause", "pause.fill", "Pause and resume",
          "Press {pause} to pause. Press it again to carry on where it left off."),
         ("lock", "lock.fill", "Lock your keyboard",
@@ -1224,6 +1225,7 @@ class Onboarding(NSObject):
         for v in list(self.stage.subviews()):
             v.removeFromSuperview()
         shortcuts = {k: binding_label(b) for k, b in c._bindings().items()}
+        shortcuts["countdown"] = c._countdown_secs
         # Text-only screens sit in the middle; the rest leave room below.
         top = H - 56 - (140 if key in ("welcome", "done") else 0)
         if key in self.KEY_STEPS:
@@ -2011,10 +2013,10 @@ rm -- "$0"   # self-delete
         root.addSubview_(self._label("HumanType", NSMakeRect(M + 26, y + 9, 90, 18),
                                      size=13.5, weight=NSFontWeightSemibold))
         # Status pill: Ready / Typing / Paused / Locked.
-        chip, cc = glass_panel(NSMakeRect(M + 118, y + 5, 92, 26), radius=13)
+        chip, cc = glass_panel(NSMakeRect(M + 118, y + 5, 112, 26), radius=13)
         self._chip_dot = color_view(NSMakeRect(11, 10, 6, 6), NSColor.systemGreenColor(), 3)
         cc.addSubview_(self._chip_dot)
-        self._chip_lbl = self._label("Ready", NSMakeRect(23, 5, 64, 16), size=11.5,
+        self._chip_lbl = self._label("Ready", NSMakeRect(23, 5, 84, 16), size=11.5,
                                      weight=NSFontWeightMedium)
         cc.addSubview_(self._chip_lbl)
         root.addSubview_(chip)
@@ -2737,6 +2739,7 @@ rm -- "$0"   # self-delete
         self._activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
             NSActivityUserInitiated | NSActivityLatencyCritical, "Typing text")
         if countdown > 0:
+            self._set_chip(f"Starts in {countdown}s", NSColor.systemOrangeColor())
             self._schedule(b"countdownTick:", 1.0)
         else:
             # A beat so the shortcut's keys are let go of; held ⌘/⌃/⌥ is
@@ -3035,9 +3038,11 @@ rm -- "$0"   # self-delete
         self._countdown_left -= 1
         if self._countdown_left > 0:
             self._set_status(f"Typing starts in {self._countdown_left}s…")
+            self._set_chip(f"Starts in {self._countdown_left}s", NSColor.systemOrangeColor())
             self._schedule(b"countdownTick:", 1.0)
         else:
             self._set_status("Typing…")
+            self._set_chip("Typing", THEME_ACCENT)
             self._schedule(b"typeStep:", 0.0)
 
     def typeStep_(self, _):
