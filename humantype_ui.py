@@ -82,6 +82,7 @@ from AppKit import (
 )
 from Foundation import (
     NSActivityLatencyCritical,
+    NSBundle,
     NSActivityUserInitiated,
     NSMakePoint,
     NSObject,
@@ -769,6 +770,392 @@ def binding_label(binding):
     return out + KEYNAMES.get(keycode, f"key{keycode}")
 
 
+ONBOARD_SAMPLE = ("Hi! This is HumanType typing for you. It moves at a natural speed, "
+                  "takes little pauses between words, and now and then makes a typo "
+                  "and fixes it, just like a real person would.")
+
+
+class _DemoKeyboard:
+    """Lets the real typing engine 'type' into a text view in the tutorial, so
+    the practice run looks exactly like the real thing without posting keys."""
+
+    def __init__(self, view):
+        self.view = view
+
+    def _edit(self, fn):
+        s = self.view.textStorage().mutableString()
+        fn(s)
+        # Plain-string edits on an emptied view fall back to black text.
+        self.view.setTextColor_(NSColor.labelColor())
+        self.view.setFont_(NSFont.systemFontOfSize_(15))
+        self.view.scrollRangeToVisible_((s.length(), 0))
+
+    def type(self, ch):
+        self._edit(lambda s: s.appendString_(ch))
+
+    def press(self, key):
+        if key == ht.Key.backspace:
+            self._edit(lambda s: s.length() and s.deleteCharactersInRange_((s.length() - 1, 1)))
+        elif key == ht.Key.enter:
+            self.type("\n")
+        elif key == ht.Key.tab:
+            self.type("\t")
+
+    def release(self, key):
+        pass
+
+
+class Onboarding(NSObject):
+    """First-run tour, drawn over the main window: paste text, then press each
+    real shortcut (Start, Pause, Lock, Stop, Type clipboard) and watch a
+    practice run react. The global key tap hands those presses to keyPressed:
+    while the tour is up (see AppController._onboarding_key). Skip anytime."""
+
+    # (key, SF Symbol, title, body; {start} etc. are filled with the shortcuts)
+    STEPS = (
+        ("welcome", "keyboard", "Welcome to HumanType",
+         "HumanType types your text for you, one key at a time, like a real person: "
+         "natural speed, little pauses, even the odd typo it fixes. This quick tour "
+         "takes about a minute."),
+        ("paste", "doc.on.clipboard", "Paste your text",
+         "Everything starts with the text box. Paste what you want typed. "
+         "There's a sample in it already, so you can practise with that."),
+        ("start", "play.fill", "Start typing",
+         "Press {start_stop} to start. Normally you'd click into your document "
+         "first; here it types into the practice box below."),
+        ("pause", "pause.fill", "Pause and resume",
+         "Press {pause} to pause. Press it again to carry on where it left off."),
+        ("lock", "lock.fill", "Lock your keyboard",
+         "Press {lock} to lock your keyboard, then mash any keys you like: nothing gets "
+         "through, only HumanType's typing does. Press {lock} again to unlock."),
+        ("stop", "stop.fill", "Stop anytime",
+         "Press {stop} to stop typing straight away."),
+        ("type_paste", "doc.on.doc", "Type what you copied",
+         "Copy text in any app, click where it should go and press {type_paste}. "
+         "HumanType types it right there. ⌘V still pastes like normal."),
+        ("done", "checkmark", "You're all set",
+         "Change the speed, realism and every shortcut in Settings. You can replay "
+         "this tour anytime from the HumanType menu in the menu bar."),
+    )
+    KEY_STEPS = {"start": ("start_stop",), "pause": ("pause",), "lock": ("lock",),
+                 "stop": ("stop",), "type_paste": ("type_paste",)}
+
+    def initWithController_(self, ctrl):
+        self = objc.super(Onboarding, self).init()
+        if self is None:
+            return None
+        self.ctrl = ctrl
+        self.index = 0
+        self.demo_locked = False    # practice lock: the tap swallows other keys
+        self._blocked = 0
+        self._presses = 0
+        self._gen = None
+        self._state = None
+        self._token = 0             # invalidates pending auto-advances
+        self._build()
+        return self
+
+    # ── Layout ───────────────────────────────────────────────────────────
+
+    @objc.python_method
+    def _build(self):
+        c = self.ctrl
+        self.view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+        self.view.addSubview_(aurora_view(self.view.bounds()))
+        self.skip_btn = c._glass_button("Skip tour", b"skip:", NSMakeRect(W - M - 104, H - 46, 104, 28), size=12)
+        self.skip_btn.setTarget_(self)
+        self.view.addSubview_(self.skip_btn)
+        self._dots = []
+        n, gap = len(self.STEPS), 16
+        x0 = (W - (n - 1) * gap) / 2 - 3.5
+        for i in range(n):
+            d = color_view(NSMakeRect(x0 + i * gap, H - 36, 7, 7), NSColor.labelColor(), 3.5)
+            self.view.addSubview_(d)
+            self._dots.append(d)
+        self.stage = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H - 56))
+        self.stage.setWantsLayer_(True)
+        self.view.addSubview_(self.stage)
+
+        # The practice box is shared by the key steps, so the run carries on
+        # from one step to the next.
+        bw, bh = W - 2 * M - 40, 150
+        self.practice, pc = glass_panel(NSMakeRect((W - bw) / 2, 150, bw, bh), radius=22)
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 12, bw - 24, bh - 24))
+        scroll.setDrawsBackground_(False)
+        scroll.setBorderType_(0)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        tv = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
+        tv.setEditable_(False)
+        tv.setSelectable_(False)
+        tv.setDrawsBackground_(False)
+        tv.setFont_(NSFont.systemFontOfSize_(15))
+        tv.setTextColor_(NSColor.labelColor())
+        tv.setTextContainerInset_((6, 8))
+        tv.setVerticallyResizable_(True)
+        scroll.setDocumentView_(tv)
+        pc.addSubview_(scroll)
+        self.practice_tv = tv
+
+        # The paste box (step 2), prefilled with the sample.
+        self.paste_card, pcc = glass_panel(NSMakeRect((W - bw) / 2, 130, bw, 190), radius=22)
+        ps = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 12, bw - 24, 166))
+        ps.setDrawsBackground_(False)
+        ps.setBorderType_(0)
+        ps.setHasVerticalScroller_(True)
+        ps.setAutohidesScrollers_(True)
+        ptv = NSTextView.alloc().initWithFrame_(ps.contentView().bounds())
+        ptv.setRichText_(False)
+        ptv.setDrawsBackground_(False)
+        ptv.setFont_(NSFont.systemFontOfSize_(15))
+        ptv.setTextColor_(NSColor.labelColor())
+        ptv.setInsertionPointColor_(NSColor.controlAccentColor())
+        ptv.setTextContainerInset_((6, 8))
+        ptv.setVerticallyResizable_(True)
+        ptv.setAutomaticQuoteSubstitutionEnabled_(False)
+        ptv.setString_(ONBOARD_SAMPLE)
+        ps.setDocumentView_(ptv)
+        pcc.addSubview_(ps)
+        self.paste_tv = ptv
+
+    @objc.python_method
+    def _keycaps(self, binding, y):
+        """The shortcut as a row of glass keycaps, centred."""
+        label = binding_label(binding)
+        mods = [ch for ch in label if ch in "⌃⌥⇧⌘"]
+        key = label[len(mods):]
+        caps = mods + [key]
+        font = NSFont.systemFontOfSize_weight_(22, NSFontWeightSemibold)
+        widths = [max(56, font.widthOfString_(t) + 32) if hasattr(font, "widthOfString_")
+                  else max(56, 16 * len(t) + 32) for t in caps]
+        gap = 10
+        x = (W - (sum(widths) + gap * (len(caps) - 1))) / 2
+        row = []
+        for t, w in zip(caps, widths):
+            cap, cc = glass_panel(NSMakeRect(x, y, w, 56), radius=14)
+            lbl = self.ctrl._label(t, NSMakeRect(0, 14, w, 28), size=22,
+                                   weight=NSFontWeightSemibold, align=NSTextAlignmentCenter)
+            cc.addSubview_(lbl)
+            self.stage.addSubview_(cap)
+            row.append(lbl)
+            x += w + gap
+        return row
+
+    @objc.python_method
+    def _show_step(self):
+        c = self.ctrl
+        self._token += 1
+        self._presses = 0
+        key, symbol, title, body = self.STEPS[self.index]
+        for i, d in enumerate(self._dots):
+            d.set_color(NSColor.controlAccentColor() if i == self.index
+                        else NSColor.labelColor().colorWithAlphaComponent_(0.18))
+        for v in list(self.stage.subviews()):
+            v.removeFromSuperview()
+        shortcuts = {k: binding_label(b) for k, b in c._bindings().items()}
+        # Text-only screens sit in the middle; the rest leave room below.
+        top = H - 56 - (140 if key in ("welcome", "done") else 0)
+
+        icon, ic = glass_panel(NSMakeRect((W - 76) / 2, top - 116, 76, 76), radius=38)
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, title)
+        if img is not None:
+            from AppKit import NSImageView, NSImageSymbolConfiguration
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 76, 76))
+            iv.setImage_(img)
+            iv.setSymbolConfiguration_(
+                NSImageSymbolConfiguration.configurationWithPointSize_weight_(28, NSFontWeightSemibold))
+            iv.setContentTintColor_(NSColor.controlAccentColor())
+            ic.addSubview_(iv)
+        self.stage.addSubview_(icon)
+        self.stage.addSubview_(c._label(title, NSMakeRect(M, top - 166, W - 2 * M, 34), size=26,
+                                        weight=NSFontWeightBold, align=NSTextAlignmentCenter))
+        b = NSTextField.wrappingLabelWithString_(body.format(**shortcuts))
+        b.setFrame_(NSMakeRect(70, top - 244, W - 140, 70))
+        b.setFont_(NSFont.systemFontOfSize_(14))
+        b.setTextColor_(NSColor.secondaryLabelColor())
+        b.setAlignment_(NSTextAlignmentCenter)
+        self.stage.addSubview_(b)
+
+        self.feedback = c._label("", NSMakeRect(M, 118, W - 2 * M, 18), size=13,
+                                 weight=NSFontWeightSemibold, align=NSTextAlignmentCenter,
+                                 color=NSColor.controlAccentColor())
+        self.caps = []
+        if key == "paste":
+            self.stage.addSubview_(self.paste_card)
+            self.view.window().makeFirstResponder_(self.paste_tv)
+        elif key in self.KEY_STEPS:
+            self.caps = self._keycaps(c._bindings()[self.KEY_STEPS[key][0]], top - 316)
+            if key != "type_paste":
+                self.practice.setFrame_(NSMakeRect(self.practice.frame().origin.x, 146,
+                                                   self.practice.frame().size.width, 120))
+                self.stage.addSubview_(self.practice)
+            self.view.window().makeFirstResponder_(None)
+        if key in self.KEY_STEPS:
+            self.stage.addSubview_(self.feedback)
+
+        primary = {"welcome": "Start the tour", "done": "Start using HumanType"}.get(key, "Next")
+        btn = c._glass_button(primary, b"next:", NSMakeRect((W - 240) / 2, 52, 240, 44),
+                              prominent=True, size=15)
+        btn.setTarget_(self)
+        self.stage.addSubview_(btn)
+        if key in self.KEY_STEPS:
+            hint = c._label("Try the shortcut, or press Next to skip this step.",
+                            NSMakeRect(M, 24, W - 2 * M, 16), size=11, gray=True,
+                            align=NSTextAlignmentCenter)
+            self.stage.addSubview_(hint)
+        self.skip_btn.setHidden_(key == "done")
+
+        if not reduce_motion():
+            self.stage.setAlphaValue_(0.0)
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.currentContext().setDuration_(0.28)
+            self.stage.animator().setAlphaValue_(1.0)
+            NSAnimationContext.endGrouping()
+
+    # ── Navigation ───────────────────────────────────────────────────────
+
+    @objc.python_method
+    def show(self):
+        c = self.ctrl
+        c.showWindow_(None)
+        c.window.contentView().addSubview_(self.view)
+        self.index = 0
+        self._show_step()
+
+    @objc.python_method
+    def current(self):
+        return self.STEPS[self.index][0]
+
+    @objc.python_method
+    def expected(self):
+        return self.KEY_STEPS.get(self.current(), ())
+
+    def next_(self, sender):
+        if self.current() == "done":
+            self._close()
+            return
+        self._leave_step()
+        self.index += 1
+        self._show_step()
+
+    def skip_(self, sender):
+        self._close()
+
+    @objc.python_method
+    def _leave_step(self):
+        if self.current() == "paste":
+            text = str(self.paste_tv.string()).strip() or ONBOARD_SAMPLE
+            self._demo_text = text[:220]
+            self.practice_tv.setString_("")
+        if self.current() == "lock":
+            self.demo_locked = False
+
+    @objc.python_method
+    def _advance_later(self, delay):
+        token = self._token
+        def go():
+            if token == self._token and self.view.superview() is not None:
+                self.next_(None)
+        NotchUpdatePanel._after(delay, go)
+
+    @objc.python_method
+    def _close(self):
+        self._stop_demo()
+        self.demo_locked = False
+        self._token += 1
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(True, "ht_onboarded")
+        text = str(self.paste_tv.string()).strip()
+        if text and text != ONBOARD_SAMPLE and not str(self.ctrl.text_view.string()).strip():
+            self.ctrl.text_view.setString_(text)
+            self.ctrl.textDidChange_(None)
+        self.view.removeFromSuperview()
+        self.ctrl._onboarding = None
+        self.ctrl._show_tab("type", animate=False)
+
+    # ── Shortcut presses (from the key tap, on the main thread) ───────────
+
+    def keyPressed_(self, name):
+        name = str(name)
+        if name not in self.expected():
+            return
+        self._presses += 1
+        for lbl in self.caps:
+            lbl.setTextColor_(NSColor.controlAccentColor())
+        step = self.current()
+        if step == "start":
+            self._start_demo()
+            self.feedback.setStringValue_("It's typing. Nice!")
+            self._advance_later(1.8)
+        elif step == "pause":
+            if self._state is None:
+                self._start_demo()
+            self._state.toggle_pause()
+            if self._state.paused:
+                self.feedback.setStringValue_("Paused. Press it again to resume.")
+            else:
+                self.feedback.setStringValue_("Typing again, right where it stopped.")
+                self._advance_later(1.6)
+        elif step == "lock":
+            self.demo_locked = not self.demo_locked
+            if self.demo_locked:
+                self._blocked = 0
+                self.feedback.setStringValue_("Locked. Mash some keys: nothing gets through.")
+            else:
+                self.feedback.setStringValue_(
+                    f"Unlocked. {self._blocked} key{'s' if self._blocked != 1 else ''} blocked.")
+                self._advance_later(1.8)
+        elif step == "stop":
+            self._stop_demo()
+            self.feedback.setStringValue_("Stopped.")
+            self._advance_later(1.4)
+        elif step == "type_paste":
+            self.feedback.setStringValue_("That's it. In any other app, that types your clipboard.")
+            self._advance_later(2.4)
+
+    @objc.python_method
+    def blocked_key(self):
+        self._blocked += 1
+        self.feedback.setStringValue_(
+            f"Locked · {self._blocked} key{'s' if self._blocked != 1 else ''} blocked. "
+            "Press it again to unlock.")
+
+    # ── Practice run ─────────────────────────────────────────────────────
+
+    @objc.python_method
+    def _start_demo(self):
+        self._stop_demo()
+        self.practice_tv.setString_("")
+        self._state = ht.TypingState()
+        wpm = max(40, min(self.ctrl._current_wpm, 90))
+        typist = ht.Typist(_DemoKeyboard(self.practice_tv), self._state,
+                           60.0 / (wpm * 5.0), 0.03)
+        self._gen = typist.steps(getattr(self, "_demo_text", ONBOARD_SAMPLE))
+        self._demo_step()
+
+    @objc.python_method
+    def _stop_demo(self):
+        if self._state is not None:
+            self._state.stop()
+        self._gen = None
+        self._state = None
+
+    @objc.python_method
+    def _demo_step(self):
+        gen, state = self._gen, self._state
+        if gen is None or state is None or state.stopped:
+            return
+        if state.paused:
+            NotchUpdatePanel._after(0.12, self._demo_step)
+            return
+        try:
+            delay = next(gen)
+        except StopIteration:
+            # Loop the sample so later steps still have something to act on.
+            NotchUpdatePanel._after(1.2, lambda: self._gen is gen and self._start_demo())
+            return
+        NotchUpdatePanel._after(max(0.0, delay), lambda: self._gen is gen and self._demo_step())
+
+
 class AppController(NSObject):
 
     # --- lifecycle ----------------------------------------------------------
@@ -787,6 +1174,8 @@ class AppController(NSObject):
         self._activity = None       # App Nap opt-out held for a typing run
         self._target_app = None     # the app being typed into (for Resume)
         self._holding = False       # typing waits while HumanType is frontmost
+        self._onboarding = None     # the first-run tour, while it's on screen
+        self._from_window = False   # the run was started with Start, not ⌃⌥V
         self._monitor = None
         self._record_button = None  # button currently awaiting a key press
         self._record_which = None   # which binding is being recorded
@@ -836,6 +1225,10 @@ class AppController(NSObject):
         d.setInteger_forKey_(binding[1], prefix + "_mods")
 
     def applicationDidFinishLaunching_(self, notification):
+        # A brand-new install has no saved settings yet: that's who gets the tour.
+        bid = NSBundle.mainBundle().bundleIdentifier()
+        first_run = bool(bid) and not NSUserDefaults.standardUserDefaults() \
+            .persistentDomainForName_(bid)
         self._build_main_menu()
         self._build_status_item()
         self._build_window()
@@ -853,6 +1246,8 @@ class AppController(NSObject):
         self._schedule(b"_checkForUpdates:", 4.0)
         if LicenseManager.is_licensed() or not LICENSING_ENABLED:
             self.showWindow_(None)
+            if first_run or "--onboarding" in sys.argv:
+                self._schedule(b"showTutorial:", 0.3)
         else:
             # Show activation screen; main window opens after successful activation.
             self._license_ctrl = LicenseWindowController.alloc().init()
@@ -1103,6 +1498,7 @@ rm -- "$0"   # self-delete
             "Lock keyboard", b"toggleLock:", "")
         self.lock_menu_item.setTarget_(self)
         menu.addItem_(self.lock_menu_item)
+        item("Show Tutorial", b"showTutorial:")
         menu.addItem_(NSMenuItem.separatorItem())
         if LICENSING_ENABLED:
             item("Enter License Key", b"showLicense:")
@@ -1790,8 +2186,10 @@ rm -- "$0"   # self-delete
     # ── Helpers ───────────────────────────────────────────────────────────
 
     @objc.python_method
-    def _set_status(self, text):
+    def _set_status(self, text, done=False):
         self.status.setStringValue_(text)
+        self.status.setTextColor_(NSColor.systemGreenColor() if done
+                                  else NSColor.secondaryLabelColor())
 
     @objc.python_method
     def _set_pause_btn(self, paused):
@@ -1838,7 +2236,35 @@ rm -- "$0"   # self-delete
         self.window.makeKeyAndOrderFront_(None)
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
+    def showTutorial_(self, sender):
+        if self._onboarding is None:
+            self._onboarding = Onboarding.alloc().initWithController_(self)
+            self._onboarding.show()
+        else:
+            self.showWindow_(None)
+
+    @objc.python_method
+    def _onboarding_key(self, key, autorepeat):
+        """While the tour is up it gets every shortcut press; returns True to
+        swallow the key. Global shortcuts that aren't being taught are held
+        back too, so Start can't kick off a real run behind the tour."""
+        ob = self._onboarding
+        names = [n for n, b in self._bindings().items() if b == key]
+        wanted = [n for n in names if n in ob.expected()]
+        if wanted:
+            if not autorepeat:
+                ob.performSelector_withObject_afterDelay_inModes_(
+                    b"keyPressed:", wanted[0], 0.0, [NSRunLoopCommonModes])
+            return True
+        if ob.demo_locked:
+            if not autorepeat:
+                ob.blocked_key()
+            return True
+        return bool(set(names) & {"start_stop", "type_paste", "lock"})
+
     def start_(self, sender):
+        if self._onboarding is not None:
+            return
         if self._typing_gen is not None:
             self._set_status("Already typing…")
             return
@@ -1866,6 +2292,7 @@ rm -- "$0"   # self-delete
             return
 
         self._run_typing(text, self._countdown_secs)
+        self._from_window = True
         self._set_status(f"Click your target box — typing starts in {self._countdown_secs}s…")
         # Stay on screen, above the app being typed into, so Pause and Stop are a
         # click away. Typing only runs while another app is frontmost (typeStep:).
@@ -1885,6 +2312,7 @@ rm -- "$0"   # self-delete
         if self._strip_fmt:
             text = " ".join(text.split())
         self._run_typing(text, 0)
+        self._from_window = False
         self._set_status("Typing what you pasted…")
 
     @objc.python_method
@@ -2053,6 +2481,8 @@ rm -- "$0"   # self-delete
             mods = int(CGEventGetFlags(event)) & ht.MOD_MASK
             key = (keycode, mods)
             typing = self._typing_gen is not None and self.state is not None
+            if self._onboarding is not None and self._onboarding_key(key, autorepeat):
+                return None
 
             # Type clipboard: in another app, type the clipboard text instead of
             # pasting it (⌘V is untouched). In HumanType's own window, or when the
@@ -2260,7 +2690,15 @@ rm -- "$0"   # self-delete
         # gets the prompt again rather than a silent auto-relaunch.
         self._asked_ax = False
         self._set_running(False)
-        self._set_status("Done." if finished else "Stopped.")
+        if finished:
+            # Stay open and say so, ready for the next one: the old text is
+            # selected, so pasting replaces it.
+            self._set_status("Complete. Paste your next text and press Start.", done=True)
+            self.text_view.setSelectedRange_((0, len(str(self.text_view.string()))))
+            if self._from_window and not self.window.isVisible():
+                self.window.orderFrontRegardless()
+        else:
+            self._set_status("Stopped.")
         if self._update_waiting:
             self._presentUpdate_(None)
 
