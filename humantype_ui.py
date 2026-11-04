@@ -6,7 +6,8 @@ paste box, a speed slider, a realism picker, Start / Pause-Resume / Stop / Quit
 buttons, snippets, and click-to-record global shortcuts. All the typing logic
 lives in humantype.py; this file is just the interface.
 
-The look is built from the real macOS 26+ glass material (NSGlassEffectView and
+The look (since 1.5): a near-black theme with a warm glow, dark bordered cards and
+a white pill for the main action. Earlier versions used the macOS 26+ glass material (NSGlassEffectView and
 glass-bezel buttons) floating over a slowly drifting colour field, because glass
 only reads as glass when there is something behind it to refract. AppKit gives
 an app the new design only when its main executable links the macOS 26+ SDK;
@@ -316,34 +317,134 @@ def aurora_view(rect):
     return v
 
 
+# ── Theme: near-black, a warm glow at the top, dark cards with hairline
+# borders, white pill for the main action. (In the spirit of Sentient OS.)
+def _rgb(r, g, b, a=1.0):
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+
+THEME_BG = _rgb(0.024, 0.024, 0.027)
+THEME_CARD = _rgb(1, 1, 1, 0.045)
+THEME_BORDER = _rgb(1, 1, 1, 0.09)
+THEME_BUTTON = _rgb(1, 1, 1, 0.07)
+THEME_ACCENT = _rgb(0.66, 0.56, 1.0)              # soft violet
+SPECTRUM = (_rgb(0.43, 0.86, 0.55), _rgb(0.33, 0.78, 0.93),
+            _rgb(0.36, 0.55, 1.0), _rgb(0.72, 0.45, 1.0))
+
+
+class GlowBackdrop(NSView):
+    """Near-black canvas with a soft amber glow spilling from the top and a
+    faint violet one low on the left."""
+
+    def drawRect_(self, dirty):
+        from AppKit import NSGradient, NSRectFill
+        b = self.bounds()
+        THEME_BG.setFill()
+        NSRectFill(b)
+        w, h = b.size.width, b.size.height
+        for (cx, cy, r, color) in ((w * 0.62, h + 40, w * 0.75, _rgb(0.95, 0.62, 0.28, 0.20)),
+                                   (w * 0.12, -60, w * 0.6, _rgb(0.55, 0.42, 1.0, 0.10))):
+            g = NSGradient.alloc().initWithStartingColor_endingColor_(
+                color, color.colorWithAlphaComponent_(0.0))
+            g.drawFromCenter_radius_toCenter_radius_options_(
+                NSMakePoint(cx, cy), 0, NSMakePoint(cx, cy), r, 0)
+
+
+def aurora_view(rect):
+    v = GlowBackdrop.alloc().initWithFrame_(rect)
+    return v
+
+
+class CardView(NSView):
+    """A dark card with a hairline border."""
+
+    def wantsUpdateLayer(self):
+        return True
+
+    def updateLayer(self):
+        L = self.layer()
+        L.setBackgroundColor_(getattr(self, "_fill", THEME_CARD).CGColor())
+        L.setBorderColor_(THEME_BORDER.CGColor())
+        L.setBorderWidth_(1.0)
+
+
 def glass_panel(rect, radius=22.0, tint=None):
-    """A real Liquid Glass panel (NSGlassEffectView). Returns (panel, content):
-    add subviews to `content`, whose coordinates are local to the panel."""
+    """A dark bordered card. Returns (panel, content): add subviews to
+    `content`, whose coordinates are local to the panel."""
+    panel = CardView.alloc().initWithFrame_(rect)
+    panel.setWantsLayer_(True)
+    if radius < rect.size.height / 2 - 1:      # cards stay crisp; pills stay pills
+        radius = min(radius, 16.0)
+    panel.layer().setCornerRadius_(radius)
+    panel.layer().setMasksToBounds_(True)
+    if tint is not None:
+        panel._fill = tint
     content = NSView.alloc().initWithFrame_(
         NSMakeRect(0, 0, rect.size.width, rect.size.height))
-    if HAS_GLASS:
-        panel = GlassEffectView.alloc().initWithFrame_(rect)
-        panel.setCornerRadius_(radius)
-        if tint is not None:
-            panel.setTintColor_(tint)
-        panel.setContentView_(content)
-    else:  # pre-26: a frosted blur with the same geometry
-        panel = NSVisualEffectView.alloc().initWithFrame_(rect)
-        panel.setMaterial_(NSVisualEffectMaterialMenu)
-        panel.setBlendingMode_(NSVisualEffectBlendingModeWithinWindow)
-        panel.setState_(NSVisualEffectStateActive)
-        panel.setWantsLayer_(True)
-        panel.layer().setCornerRadius_(radius)
-        panel.layer().setMasksToBounds_(True)
-        panel.addSubview_(content)
+    panel.addSubview_(content)
+    panel.setNeedsDisplay_(True)
     return panel, content
+
+
+class ThemeButton(NSButton):
+    """Flat themed button: dark with a hairline border, or (prominent) a white
+    pill with black text. Dims when disabled."""
+
+    @objc.python_method
+    def style(self, prominent, radius):
+        self._prominent = prominent
+        self.setBordered_(False)
+        self.setWantsLayer_(True)
+        L = self.layer()
+        L.setCornerRadius_(radius)
+        L.setBackgroundColor_((NSColor.whiteColor() if prominent else THEME_BUTTON).CGColor())
+        L.setBorderWidth_(0.0 if prominent else 1.0)
+        L.setBorderColor_(THEME_BORDER.CGColor())
+        self.setContentTintColor_(NSColor.blackColor() if prominent else NSColor.whiteColor())
+        self._ink()
+
+    @objc.python_method
+    def _ink(self):
+        from AppKit import (NSAttributedString, NSForegroundColorAttributeName,
+                            NSFontAttributeName)
+        color = NSColor.blackColor() if getattr(self, "_prominent", False) \
+            else _rgb(1, 1, 1, 0.9)
+        self.setAttributedTitle_(NSAttributedString.alloc().initWithString_attributes_(
+            str(self.title()), {NSForegroundColorAttributeName: color,
+                                NSFontAttributeName: self.font()}))
+
+    def setTitle_(self, t):
+        objc.super(ThemeButton, self).setTitle_(t)
+        if hasattr(self, "_prominent"):
+            self._ink()
+
+    def setEnabled_(self, on):
+        objc.super(ThemeButton, self).setEnabled_(on)
+        self.setAlphaValue_(1.0 if on else 0.38)
+
+
+class SpectrumSliderCell(objc.lookUpClass("NSSliderCell")):
+    """Slider whose filled track is the green→blue→violet spectrum."""
+
+    def drawBarInside_flipped_(self, rect, flipped):
+        from AppKit import NSBezierPath, NSGradient
+        h = 5.0
+        bar = NSMakeRect(rect.origin.x, rect.origin.y + (rect.size.height - h) / 2,
+                         rect.size.width, h)
+        _rgb(1, 1, 1, 0.12).setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bar, h / 2, h / 2).fill()
+        lo, hi = self.minValue(), self.maxValue()
+        frac = 0.0 if hi <= lo else (self.doubleValue() - lo) / (hi - lo)
+        filled = NSMakeRect(bar.origin.x, bar.origin.y, max(h, bar.size.width * frac), h)
+        NSGradient.alloc().initWithColors_(list(SPECTRUM)).drawInBezierPath_angle_(
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(filled, h / 2, h / 2), 0)
 
 
 def glass_group(rect, spacing=12.0):
     """NSGlassEffectContainerView: glass controls inside it render as one
     material and melt into each other when close. Returns (group, content)."""
-    content = NSView.alloc().initWithFrame_(
-        NSMakeRect(0, 0, rect.size.width, rect.size.height))
+    content = NSView.alloc().initWithFrame_(rect)
+    return content, content
     if not HAS_GLASS:
         content.setFrame_(rect)
         return content, content
@@ -1001,6 +1102,9 @@ class Onboarding(NSObject):
          "HumanType types your text for you, one key at a time, like a real person: "
          "natural speed, little pauses, even the odd typo it fixes. This quick tour "
          "takes about a minute."),
+        ("permission", "lock.shield", "Let HumanType type for you",
+         "macOS only lets an app press keys for you once you allow it. Open "
+         "Settings, switch on HumanType under Accessibility, then come back here."),
         ("paste", "doc.on.clipboard", "Paste your text",
          "Everything starts with the text box. Paste what you want typed. "
          "There's a sample in it already, so you can practise with that."),
@@ -1115,8 +1219,8 @@ class Onboarding(NSObject):
         self._presses = 0
         key, symbol, title, body = self.STEPS[self.index]
         for i, d in enumerate(self._dots):
-            d.set_color(NSColor.controlAccentColor() if i == self.index
-                        else NSColor.labelColor().colorWithAlphaComponent_(0.18))
+            d.set_color(NSColor.whiteColor() if i == self.index
+                        else NSColor.whiteColor().colorWithAlphaComponent_(0.18))
         for v in list(self.stage.subviews()):
             v.removeFromSuperview()
         shortcuts = {k: binding_label(b) for k, b in c._bindings().items()}
@@ -1133,7 +1237,7 @@ class Onboarding(NSObject):
             iv.setImage_(img)
             iv.setSymbolConfiguration_(
                 NSImageSymbolConfiguration.configurationWithPointSize_weight_(28, NSFontWeightSemibold))
-            iv.setContentTintColor_(NSColor.controlAccentColor())
+            iv.setContentTintColor_(NSColor.whiteColor())
             ic.addSubview_(iv)
         if key not in self.KEY_STEPS:
             self.stage.addSubview_(icon)
@@ -1148,7 +1252,7 @@ class Onboarding(NSObject):
 
         self.feedback = c._label("", NSMakeRect(M, 104, W - 2 * M, 18), size=13,
                                  weight=NSFontWeightSemibold, align=NSTextAlignmentCenter,
-                                 color=NSColor.controlAccentColor())
+                                 color=THEME_ACCENT)
         if key == "paste":
             self.stage.addSubview_(self.paste_card)
             self.view.window().makeFirstResponder_(self.paste_tv)
@@ -1179,6 +1283,9 @@ class Onboarding(NSObject):
                               prominent=True, size=15)
         btn.setTarget_(self)
         self.stage.addSubview_(btn)
+        self._primary = btn
+        if key == "permission":
+            self._build_permission(top - 330)
         if key in self.KEY_STEPS:
             hint = c._label("Try the shortcut, or press Next to skip this step.",
                             NSMakeRect(M, 24, W - 2 * M, 16), size=11, gray=True,
@@ -1196,12 +1303,95 @@ class Onboarding(NSObject):
     # ── Navigation ───────────────────────────────────────────────────────
 
     @objc.python_method
-    def show(self):
+    def show(self, step=None):
         c = self.ctrl
         c.showWindow_(None)
         c.window.contentView().addSubview_(self.view)
-        self.index = 0
+        keys = [k for k, *_ in self.STEPS]
+        self.index = keys.index(step) if step in keys else 0
         self._show_step()
+
+    # ── Permission step ──────────────────────────────────────────────────
+    # Accessibility lets HumanType post keystrokes and run its shortcut tap.
+    # The step watches for the switch, then tries to start the tap right
+    # away; only if macOS still refuses does it ask for a quick reopen.
+
+    @objc.python_method
+    def _build_permission(self, y):
+        c = self.ctrl
+        cw = W - 2 * M - 40
+        card, cc = glass_panel(NSMakeRect((W - cw) / 2, y, cw, 76), radius=14)
+        from AppKit import NSImageView, NSImageSymbolConfiguration
+        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 26, 24, 24))
+        iv.setImage_(NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "accessibility", "Accessibility"))
+        iv.setSymbolConfiguration_(
+            NSImageSymbolConfiguration.configurationWithPointSize_weight_(17, NSFontWeightMedium))
+        iv.setContentTintColor_(NSColor.whiteColor())
+        cc.addSubview_(iv)
+        cc.addSubview_(c._label("Accessibility", NSMakeRect(54, 40, 220, 18), size=13.5,
+                                weight=NSFontWeightSemibold))
+        self._perm_detail = c._label("", NSMakeRect(54, 18, cw - 54 - 190, 18), size=12, gray=True)
+        cc.addSubview_(self._perm_detail)
+        self._perm_btn = c._glass_button("Open Settings", b"permAction:",
+                                         NSMakeRect(cw - 18 - 160, 20, 160, 36), size=13)
+        self._perm_btn.setTarget_(self)
+        cc.addSubview_(self._perm_btn)
+        self._perm_ok = c._label("", NSMakeRect(cw - 18 - 160, 28, 160, 20), size=13,
+                                 weight=NSFontWeightSemibold, align=NSTextAlignmentRight,
+                                 color=NSColor.systemGreenColor())
+        cc.addSubview_(self._perm_ok)
+        self.stage.addSubview_(card)
+        self._perm_note = c._label("", NSMakeRect(M, y - 30, W - 2 * M, 18), size=12,
+                                   gray=True, align=NSTextAlignmentCenter)
+        self.stage.addSubview_(self._perm_note)
+        self._perm_state = None
+        self._perm_poll(self._token)
+
+    @objc.python_method
+    def _perm_poll(self, token):
+        if token != self._token or self.view.superview() is None:
+            return
+        c = self.ctrl
+        trusted = c._is_trusted()
+        if trusted and c._tap is None:
+            c._install_global_tap()          # often works straight away
+        state = "ok" if trusted and c._tap is not None else ("reopen" if trusted else "off")
+        if state != self._perm_state:
+            self._perm_state = state
+            if state == "ok":
+                self._perm_detail.setStringValue_("Allowed. You're good to go.")
+                self._perm_btn.setHidden_(True)
+                self._perm_ok.setStringValue_("✓ Allowed")
+                self._perm_note.setStringValue_("")
+                self._primary.setEnabled_(True)
+            elif state == "reopen":
+                self._perm_detail.setStringValue_("Switched on. macOS needs a restart to apply it.")
+                self._perm_btn.setTitle_("Reopen HumanType")
+                self._perm_btn.setHidden_(False)
+                self._perm_ok.setStringValue_("")
+                self._perm_note.setStringValue_(
+                    "HumanType will quit and open again right here, at this step.")
+                self._primary.setEnabled_(False)
+            else:
+                self._perm_detail.setStringValue_("Not allowed yet.")
+                self._perm_btn.setTitle_("Open Settings")
+                self._perm_btn.setHidden_(False)
+                self._perm_ok.setStringValue_("")
+                self._perm_note.setStringValue_(
+                    "In Privacy & Security → Accessibility, switch on HumanType. "
+                    "This screen updates by itself.")
+                self._primary.setEnabled_(False)
+        NotchUpdatePanel._after(1.0, lambda: self._perm_poll(token))
+
+    def permAction_(self, sender):
+        c = self.ctrl
+        if self._perm_state == "reopen":
+            NSUserDefaults.standardUserDefaults().setObject_forKey_("permission", "ht_resume_tour")
+            c._relaunch()
+        else:
+            c._prompt_accessibility()
+            c._open_accessibility_settings()
 
     @objc.python_method
     def current(self):
@@ -1416,7 +1606,12 @@ class AppController(NSObject):
         self._schedule(b"_checkForUpdates:", 4.0)
         if LicenseManager.is_licensed() or not LICENSING_ENABLED:
             self.showWindow_(None)
-            if first_run or "--onboarding" in sys.argv:
+            resume = NSUserDefaults.standardUserDefaults().stringForKey_("ht_resume_tour")
+            if resume:      # reopened from the tour's permission step: carry on there
+                NSUserDefaults.standardUserDefaults().removeObjectForKey_("ht_resume_tour")
+                self._resume_step = str(resume)
+                self._schedule(b"showTutorial:", 0.3)
+            elif first_run or "--onboarding" in sys.argv:
                 self._schedule(b"showTutorial:", 0.3)
         else:
             # Show activation screen; main window opens after successful activation.
@@ -1704,14 +1899,10 @@ rm -- "$0"   # self-delete
     @objc.python_method
     def _glass_button(self, title, sel, rect, *, symbol=None, prominent=False,
                       size=13, icon_only=False):
-        """A Liquid Glass capsule button (NSBezelStyleGlass). `prominent` tints
-        the glass with the accent colour, for the one primary action."""
-        btn = NSButton.buttonWithTitle_target_action_(title, self, sel)
-        btn.setBezelStyle_(BEZEL_GLASS if HAS_GLASS else BEZEL_ROUNDED)
+        """A themed button (see ThemeButton). `prominent` makes it the white
+        pill, for the one primary action."""
+        btn = ThemeButton.buttonWithTitle_target_action_(title, self, sel)
         h = rect.size.height
-        btn.setControlSize_(NSControlSizeLarge if h >= 34
-                            else NSControlSizeRegular if h >= 26
-                            else NSControlSizeSmall)
         btn.setFrame_(rect)
         btn.setFont_(NSFont.systemFontOfSize_weight_(
             size, NSFontWeightSemibold if prominent else NSFontWeightMedium))
@@ -1719,12 +1910,8 @@ rm -- "$0"   # self-delete
             set_symbol(btn, symbol, only=icon_only, label=title)
         if icon_only:
             btn.setToolTip_(title)
-            if HAS_GLASS:
-                btn.setBorderShape_(BORDER_CIRCLE)
-        if prominent:
-            btn.setBezelColor_(NSColor.controlAccentColor())
-            if HAS_GLASS:
-                btn.setTintProminence_(TINT_PRIMARY)
+            btn.setTitle_("")
+        btn.style(prominent, h / 2 if (prominent or icon_only) else min(10, h / 2))
         return btn
 
     @objc.python_method
@@ -1734,16 +1921,15 @@ rm -- "$0"   # self-delete
 
     @objc.python_method
     def _section_header(self, text, parent, x, y, w):
-        lbl = NSTextField.labelWithString_(text.upper())
-        lbl.setFrame_(NSMakeRect(x, y, w, 14))
-        lbl.setFont_(NSFont.systemFontOfSize_weight_(10.5, NSFontWeightSemibold))
-        lbl.setTextColor_(NSColor.secondaryLabelColor())
+        lbl = NSTextField.labelWithString_(text)
+        lbl.setFrame_(NSMakeRect(x - 16, y - 2, w, 18))
+        lbl.setFont_(NSFont.systemFontOfSize_weight_(13.5, NSFontWeightSemibold))
+        lbl.setTextColor_(NSColor.labelColor())
         parent.addSubview_(lbl)
 
     @objc.python_method
     def _separator(self, parent, x, y, w):
-        parent.addSubview_(color_view(NSMakeRect(x, y, w, 0.5),
-                                      NSColor.separatorColor()))
+        parent.addSubview_(color_view(NSMakeRect(x, y, w, 1.0), THEME_BORDER))
 
     @objc.python_method
     def _page_title(self, parent, title, subtitle):
@@ -1757,6 +1943,7 @@ rm -- "$0"   # self-delete
     @objc.python_method
     def _add_slider(self, parent, rect, lo, hi, val, sel):
         sl = NSSlider.alloc().initWithFrame_(rect)
+        sl.setCell_(SpectrumSliderCell.alloc().init())
         sl.setMinValue_(lo)
         sl.setMaxValue_(hi)
         sl.setFloatValue_(val)
@@ -1781,14 +1968,16 @@ rm -- "$0"   # self-delete
         self.window.setTitlebarAppearsTransparent_(True)
         self.window.setTitleVisibility_(NSWindowTitleHidden)
         self.window.setMovableByWindowBackground_(True)
+        from AppKit import NSAppearance, NSAppearanceNameDarkAqua
+        self.window.setAppearance_(NSAppearance.appearanceNamed_(NSAppearanceNameDarkAqua))
         self.window.center()
 
-        # Layer 0: the drifting colour field the glass refracts.
+        # Layer 0: the dark backdrop with its glow.
         root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
         root.addSubview_(aurora_view(root.bounds()))
         self.window.setContentView_(root)
 
-        # Pages, then the floating tab bar above them.
+        # Pages, then the header above them.
         self._tab_type = self._page(root)
         self._build_type_page(self._tab_type)
         self._tab_snippets = self._page(root)
@@ -1806,27 +1995,55 @@ rm -- "$0"   # self-delete
 
     @objc.python_method
     def _build_tab_bar(self, root):
-        """A floating glass capsule with a sliding selection lens: the iOS 26/27
-        tab bar, moved to the top of a Mac window."""
-        seg_w, seg_h, pad = 116, 34, 4
-        bar_w, bar_h = len(TABS) * seg_w + 2 * pad, seg_h + 2 * pad
-        bar, content = glass_panel(
-            NSMakeRect((W - bar_w) / 2, H - bar_h - 12, bar_w, bar_h),
-            radius=bar_h / 2)
-        self._tab_lens = color_view(
-            NSMakeRect(pad, pad, seg_w, seg_h),
-            NSColor.labelColor().colorWithAlphaComponent_(0.11), seg_h / 2)
-        content.addSubview_(self._tab_lens)
+        """The header: app mark, name and a status pill on the left; the pages
+        as icon + label buttons and a round settings button on the right."""
+        y, hh = H - 64, 36
+        mark = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "record.circle", "HumanType")
+        from AppKit import NSImageView, NSImageSymbolConfiguration
+        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(M, y + 8, 20, 20))
+        if mark is not None:
+            iv.setImage_(mark)
+            iv.setSymbolConfiguration_(
+                NSImageSymbolConfiguration.configurationWithPointSize_weight_(15, NSFontWeightMedium))
+            iv.setContentTintColor_(NSColor.whiteColor())
+        root.addSubview_(iv)
+        root.addSubview_(self._label("HumanType", NSMakeRect(M + 26, y + 9, 90, 18),
+                                     size=13.5, weight=NSFontWeightSemibold))
+        # Status pill: Ready / Typing / Paused / Locked.
+        chip, cc = glass_panel(NSMakeRect(M + 118, y + 5, 92, 26), radius=13)
+        self._chip_dot = color_view(NSMakeRect(11, 10, 6, 6), NSColor.systemGreenColor(), 3)
+        cc.addSubview_(self._chip_dot)
+        self._chip_lbl = self._label("Ready", NSMakeRect(23, 5, 64, 16), size=11.5,
+                                     weight=NSFontWeightMedium)
+        cc.addSubview_(self._chip_lbl)
+        root.addSubview_(chip)
+        self._chip = chip
+
         self._nav_btns = {}
-        for i, (title, sym, key, sel) in enumerate(TABS):
+        x = W - M
+        gear = self._glass_button("Settings", b"showTabSettings:",
+                                  NSMakeRect(x - hh, y, hh, hh), symbol="gearshape",
+                                  icon_only=True, size=14)
+        root.addSubview_(gear)
+        self._nav_btns["settings"] = gear
+        x -= hh + 10
+        for title, sym, key, sel in reversed([t for t in TABS if t[2] != "settings"]):
             btn = NSButton.buttonWithTitle_target_action_(title, self, sel)
             btn.setBordered_(False)
-            btn.setFrame_(NSMakeRect(pad + i * seg_w, pad, seg_w, seg_h))
-            btn.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
+            btn.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium))
             set_symbol(btn, sym)
-            content.addSubview_(btn)
+            bw = btn.fittingSize().width + 14
+            btn.setFrame_(NSMakeRect(x - bw, y + 4, bw, 28))
+            root.addSubview_(btn)
             self._nav_btns[key] = btn
-        root.addSubview_(bar)
+            x -= bw + 6
+
+    @objc.python_method
+    def _set_chip(self, text, color):
+        if getattr(self, "_chip_lbl", None) is not None:
+            self._chip_lbl.setStringValue_(text)
+            self._chip_dot.set_color(color)
 
     # ── Type page ────────────────────────────────────────────────────────
 
@@ -1899,7 +2116,7 @@ rm -- "$0"   # self-delete
         self._wpm_lbl = self._label(
             f"{self._current_wpm} wpm", NSMakeRect(cw - 94, 63, 76, 18),
             size=13, weight=NSFontWeightSemibold,
-            color=NSColor.controlAccentColor(), align=NSTextAlignmentRight)
+            color=THEME_ACCENT, align=NSTextAlignmentRight)
         c.addSubview_(self._wpm_lbl)
         self._separator(c, 18, 48, cw - 36)
         c.addSubview_(self._label("Realism", NSMakeRect(18, 15, 70, 18),
@@ -1907,6 +2124,7 @@ rm -- "$0"   # self-delete
         self._realism_seg = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
             list(REALISM), 0, self, b"realismChanged:")   # 0 = select-one
         self._realism_seg.setFrame_(NSMakeRect(96, 11, 250, 26))
+        self._realism_seg.setSelectedSegmentBezelColor_(_rgb(1, 1, 1, 0.2))
         c.addSubview_(self._realism_seg)
         self._realism_hint = self._label(
             "", NSMakeRect(cw - 188, 15, 170, 18), size=12, gray=True,
@@ -1942,7 +2160,7 @@ rm -- "$0"   # self-delete
             NSMakeRect(M, pb_y, cw, pb_h),
             NSColor.labelColor().colorWithAlphaComponent_(0.08), pb_h / 2))
         self._prog_fill = color_view(NSMakeRect(M, pb_y, 0, pb_h),
-                                     NSColor.controlAccentColor(), pb_h / 2)
+                                     THEME_ACCENT, pb_h / 2)
         tp.addSubview_(self._prog_fill)
         self._prog_max_w = cw
 
@@ -2101,22 +2319,14 @@ rm -- "$0"   # self-delete
                   "settings": self._tab_settings}
         for k, p in panels.items():
             p.setHidden_(k != name)
-        # Slide the lens under the selected tab with a slight overshoot — the
-        # "liquid" settle of the iOS tab bar — and tint that tab like iOS does.
-        target = self._nav_btns[name].frame()
-        if animate and not reduce_motion():
-            NSAnimationContext.beginGrouping()
-            ctx = NSAnimationContext.currentContext()
-            ctx.setDuration_(0.34)
-            ctx.setTimingFunction_(
-                CAMediaTimingFunction.functionWithControlPoints____(0.3, 1.3, 0.5, 1.0))
-            self._tab_lens.animator().setFrame_(target)
-            NSAnimationContext.endGrouping()
-        else:
-            self._tab_lens.setFrame_(target)
+        # The current page's header button is white, the others dimmed.
         for k, btn in self._nav_btns.items():
-            btn.setContentTintColor_(NSColor.labelColor() if k == name
-                                     else NSColor.secondaryLabelColor())
+            if k == "settings":
+                btn.layer().setBackgroundColor_(
+                    (_rgb(1, 1, 1, 0.16) if k == name else THEME_BUTTON).CGColor())
+            else:
+                btn.setContentTintColor_(NSColor.whiteColor() if k == name
+                                         else _rgb(1, 1, 1, 0.5))
 
     def showTabType_(self, sender):
         self._show_tab("type")
@@ -2369,6 +2579,8 @@ rm -- "$0"   # self-delete
 
     @objc.python_method
     def _set_running(self, running):
+        self._set_chip("Typing" if running else "Ready",
+                       THEME_ACCENT if running else NSColor.systemGreenColor())
         self.start_btn.setEnabled_(not running)
         self.pause_btn.setEnabled_(running)
         self.stop_btn.setEnabled_(running)
@@ -2410,7 +2622,8 @@ rm -- "$0"   # self-delete
     def showTutorial_(self, sender):
         if self._onboarding is None:
             self._onboarding = Onboarding.alloc().initWithController_(self)
-            self._onboarding.show()
+            self._onboarding.show(getattr(self, "_resume_step", None))
+            self._resume_step = None
             self._sync_dnd_remap()
         else:
             self.showWindow_(None)
@@ -2754,6 +2967,8 @@ rm -- "$0"   # self-delete
             return
         self._set_pause_btn(self.state.paused)
         self._set_status("Paused." if self.state.paused else "Typing…")
+        self._set_chip("Paused" if self.state.paused else "Typing",
+                       NSColor.systemOrangeColor() if self.state.paused else THEME_ACCENT)
         if self._onboarding is not None:
             self._onboarding.event("pause" if self.state.paused else "resume")
 
@@ -2777,6 +2992,12 @@ rm -- "$0"   # self-delete
                 self.status_item.button().setImage_(img)
         except Exception:
             pass
+        if self._kbd_locked:
+            self._set_chip("Locked", NSColor.systemOrangeColor())
+        else:
+            running = self._typing_gen is not None
+            self._set_chip("Typing" if running else "Ready",
+                           THEME_ACCENT if running else NSColor.systemGreenColor())
         if self._kbd_locked:
             self._set_status("Keyboard locked — physical keys ignored.")
             if hasattr(self, "_lock_lbl"):
@@ -2909,6 +3130,8 @@ rm -- "$0"   # self-delete
         self.state.toggle_pause()
         self._set_pause_btn(self.state.paused)
         self._set_status("Paused." if self.state.paused else "Typing…")
+        self._set_chip("Paused" if self.state.paused else "Typing",
+                       NSColor.systemOrangeColor() if self.state.paused else THEME_ACCENT)
         if self._onboarding is not None:
             self._onboarding.event("pause" if self.state.paused else "resume")
         # Resumed from HumanType's own window: hand focus back to the app being
