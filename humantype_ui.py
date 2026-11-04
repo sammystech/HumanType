@@ -77,6 +77,8 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowTitleHidden,
     NSWorkspace,
+    NSFloatingWindowLevel,
+    NSNormalWindowLevel,
 )
 from Foundation import (
     NSActivityLatencyCritical,
@@ -783,6 +785,8 @@ class AppController(NSObject):
         self._typing_gen = None     # active steps() generator while typing
         self._countdown_left = 0
         self._activity = None       # App Nap opt-out held for a typing run
+        self._target_app = None     # the app being typed into (for Resume)
+        self._holding = False       # typing waits while HumanType is frontmost
         self._monitor = None
         self._record_button = None  # button currently awaiting a key press
         self._record_which = None   # which binding is being recorded
@@ -1863,7 +1867,9 @@ rm -- "$0"   # self-delete
 
         self._run_typing(text, self._countdown_secs)
         self._set_status(f"Click your target box — typing starts in {self._countdown_secs}s…")
-        self.window.orderOut_(None)  # get out of the way so the target gets focus
+        # Stay on screen, above the app being typed into, so Pause and Stop are a
+        # click away. Typing only runs while another app is frontmost (typeStep:).
+        self.window.setLevel_(NSFloatingWindowLevel)
 
     def typePasted_(self, text):
         """Type-clipboard shortcut: the target already has focus (that's where
@@ -2203,6 +2209,20 @@ rm -- "$0"   # self-delete
         if self.state.paused:
             self._schedule(b"typeStep:", 0.12)
             return
+        # HumanType itself is frontmost (the countdown ran out before you clicked
+        # away, or you clicked its window): keys would land in its own text box,
+        # so wait until another app has focus again.
+        if NSApplication.sharedApplication().isActive():
+            if not self._holding:
+                self._holding = True
+                self._set_status("Click where you want it typed…")
+            self._schedule(b"typeStep:", 0.12)
+            return
+        if self._holding:
+            self._holding = False
+            self._set_status("Typing…")
+        if self._target_app is None:
+            self._target_app = NSWorkspace.sharedWorkspace().frontmostApplication()
         try:
             delay = next(self._typing_gen)
         except StopIteration:
@@ -2228,6 +2248,9 @@ rm -- "$0"   # self-delete
         self._cancel_typing_timers()
         self._typing_gen = None
         self.typist = None
+        self._target_app = None
+        self._holding = False
+        self.window.setLevel_(NSNormalWindowLevel)
         if self._activity is not None:
             NSProcessInfo.processInfo().endActivity_(self._activity)
             self._activity = None
@@ -2247,6 +2270,11 @@ rm -- "$0"   # self-delete
         self.state.toggle_pause()
         self._set_pause_btn(self.state.paused)
         self._set_status("Paused." if self.state.paused else "Typing…")
+        # Resumed from HumanType's own window: hand focus back to the app being
+        # typed into, so typing carries on there (typeStep: waits until it has it).
+        if (not self.state.paused and self._target_app is not None
+                and NSApplication.sharedApplication().isActive()):
+            self._target_app.activateWithOptions_(0)
 
     def stop_(self, sender):
         if self.state is not None:
