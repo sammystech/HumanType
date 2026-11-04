@@ -912,30 +912,12 @@ class KeyboardView(NSView):
             text(main, h * 0.42, NSMakeRect(x, y + (h - h * 0.62) / 2, w, h * 0.62))
 
     def drawRect_(self, dirty):
-        from AppKit import NSBezierPath, NSGradient
+        from AppKit import NSBezierPath
         b = self.bounds()
-        bw, bh = b.size.width, b.size.height
-        # Silver aluminium top case, as in Apple's product shots.
-        deck = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(b, 18, 18)
-        NSGradient.alloc().initWithStartingColor_endingColor_(
-            NSColor.colorWithWhite_alpha_(0.86, 1.0),
-            NSColor.colorWithWhite_alpha_(0.72, 1.0)).drawInBezierPath_angle_(deck, 90)
-        # Speaker grilles either side of the keyboard.
-        grille, edge = 14.0, 8.0
-        NSColor.colorWithWhite_alpha_(0.0, 0.32).setFill()
-        for gx in (edge, bw - edge - grille):
-            yy = edge + 4
-            while yy < bh - edge - 4:
-                xx = gx + 1.5
-                while xx < gx + grille - 1:
-                    NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(xx, yy, 1.6, 1.6)).fill()
-                    xx += 3.4
-                yy += 3.4
-        # The black keyboard well.
-        wx = edge + grille + 6
-        well = NSMakeRect(wx, edge, bw - 2 * wx, bh - 2 * edge)
+        # Just the black keyboard: no aluminium case or speaker grilles.
+        well = b
         NSColor.colorWithWhite_alpha_(0.03, 1.0).setFill()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(well, 12, 12).fill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(well, 14, 14).fill()
 
         pad = 6.0
         gap = well.size.width * 0.0105
@@ -964,6 +946,41 @@ class KeyboardView(NSView):
                     self._key(NSMakeRect(x, y, w, key_h), kind, main, extra, kc)
                 x += w + gap
             y += key_h + gap
+
+
+class _ViewKeyboard:
+    """The tour's keyboard: the real typing engine (speed, pauses, typos and
+    their fixes) writes straight into the practice box, so it types the moment
+    a run starts, wherever focus is."""
+
+    def __init__(self, view, on_change=None):
+        self.view = view
+        self.on_change = on_change
+
+    def _edit(self, fn):
+        s = self.view.textStorage().mutableString()
+        fn(s)
+        # Plain-string edits on an emptied view fall back to black text.
+        self.view.setTextColor_(NSColor.labelColor())
+        self.view.setFont_(NSFont.systemFontOfSize_(15))
+        self.view.scrollRangeToVisible_((s.length(), 0))
+        self.view.setSelectedRange_((s.length(), 0))
+        if self.on_change:
+            self.on_change()
+
+    def type(self, ch):
+        self._edit(lambda s: s.appendString_(ch))
+
+    def press(self, key):
+        if key == ht.Key.backspace:
+            self._edit(lambda s: s.length() and s.deleteCharactersInRange_((s.length() - 1, 1)))
+        elif key == ht.Key.enter:
+            self.type("\n")
+        elif key == ht.Key.tab:
+            self.type("\t")
+
+    def release(self, key):
+        pass
 
 
 ONBOARD_SAMPLE = ("Hi! This is HumanType typing for you. It moves at a natural speed, "
@@ -996,7 +1013,8 @@ class Onboarding(NSObject):
          "Press {lock} to lock your keyboard, then mash any keys you like: nothing gets "
          "through, only HumanType's typing does. Press {lock} again to unlock."),
         ("stop", "stop.fill", "Stop anytime",
-         "Press {stop} to stop typing straight away."),
+         "Press {start_stop} again to stop typing straight away. The same shortcut "
+         "starts and stops."),
         ("type_paste", "doc.on.doc", "Type what you copied",
          "Copy some text, then press {type_paste}: HumanType types it right where "
          "you're typing, in any app. ⌘V still pastes like normal."),
@@ -1005,7 +1023,7 @@ class Onboarding(NSObject):
          "this tour anytime from the HumanType menu in the menu bar."),
     )
     KEY_STEPS = {"start": ("start_stop",), "pause": ("pause",), "lock": ("lock",),
-                 "stop": ("stop",), "type_paste": ("type_paste",)}
+                 "stop": ("start_stop",), "type_paste": ("type_paste",)}
 
     def initWithController_(self, ctrl):
         self = objc.super(Onboarding, self).init()
@@ -1043,9 +1061,9 @@ class Onboarding(NSObject):
 
         # The practice box is shared by the key steps, so the run carries on
         # from one step to the next.
-        bw, bh = W - 2 * M - 40, 150
-        self.practice, pc = glass_panel(NSMakeRect((W - bw) / 2, 150, bw, bh), radius=22)
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 12, bw - 24, bh - 24))
+        bw, bh = W - 2 * M - 40, 80
+        self.practice, pc = glass_panel(NSMakeRect((W - bw) / 2, 132, bw, bh), radius=20)
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 6, bw - 24, bh - 12))
         scroll.setDrawsBackground_(False)
         scroll.setBorderType_(0)
         scroll.setHasVerticalScroller_(True)
@@ -1061,12 +1079,16 @@ class Onboarding(NSObject):
         tv.setAutomaticTextReplacementEnabled_(False)
         tv.setTextContainerInset_((6, 8))
         tv.setVerticallyResizable_(True)
+        tv.setDelegate_(self)       # textDidChange_ hides the hint as you type
         scroll.setDocumentView_(tv)
+        # Hint under the (transparent) text view while the box is empty.
+        self.practice_hint = c._label("", NSMakeRect(20, 0, bw - 40, 20), size=14, dim=True)
+        pc.addSubview_(self.practice_hint)
         pc.addSubview_(scroll)
         self.practice_tv = tv
 
         # The paste box (step 2), prefilled with the sample.
-        self.paste_card, pcc = glass_panel(NSMakeRect((W - bw) / 2, 130, bw, 190), radius=22)
+        self.paste_card, pcc = glass_panel(NSMakeRect((W - bw) / 2, 130, bw, 190), radius=20)
         ps = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 12, bw - 24, 166))
         ps.setDrawsBackground_(False)
         ps.setBorderType_(0)
@@ -1135,14 +1157,20 @@ class Onboarding(NSObject):
             kb = KeyboardView.alloc().initWithFrame_(NSMakeRect((W - kw) / 2, 220, kw, kh))
             kb.set_lit(binding_keycodes(c._bindings()[self.KEY_STEPS[key][0]]))
             self.stage.addSubview_(kb)
-            self.practice.setFrame_(NSMakeRect(self.practice.frame().origin.x, 132,
-                                               self.practice.frame().size.width, 80))
             self.stage.addSubview_(self.practice)
+            pw = self.practice.frame().size.width
+            self.practice_hint.setFrame_(NSMakeRect(20, 30, pw - 40, 20))
+            self.practice_hint.setStringValue_(
+                f"Press {binding_label(c.start_stop_binding)} and watch it type here.")
+            self.practice_hint.setHidden_(c._typing_gen is not None
+                                          or bool(str(self.practice_tv.string())))
         if key in self.KEY_STEPS:
             self.stage.addSubview_(self.feedback)
+        self._ran_this_step = False
         if key in ("pause", "lock", "stop") and c._typing_gen is None:
             token = self._token
-            NotchUpdatePanel._after(0.6, lambda: token == self._token and self.start_practice())
+            NotchUpdatePanel._after(0.6, lambda: token == self._token
+                                    and not self._ran_this_step and self.start_practice())
         elif c._practice_run and self.practice_visible():
             self.view.window().makeFirstResponder_(self.practice_tv)
 
@@ -1233,6 +1261,9 @@ class Onboarding(NSObject):
     # and every shortcut does exactly what it does in normal use, at any step.
     # The app reports what happened through event(); the tour reacts.
 
+    def textDidChange_(self, notification):
+        self.practice_hint.setHidden_(bool(str(self.practice_tv.string())))
+
     @objc.python_method
     def practice_visible(self):
         return self.practice.superview() is not None
@@ -1242,10 +1273,13 @@ class Onboarding(NSObject):
         c = self.ctrl
         if c._typing_gen is not None or not self.practice_visible():
             return False
+        self._ran_this_step = True
         self.practice_tv.setString_("")
+        self.practice_hint.setHidden_(True)
         self.view.window().makeFirstResponder_(self.practice_tv)
         c._practice_run = True
-        c._run_typing(text if text is not None else self._demo_text, 0)
+        c._run_typing(text if text is not None else self._demo_text, 0,
+                      kb=_ViewKeyboard(self.practice_tv))
         c._from_window = False
         c._set_status("Typing into the practice box…")
         self.event(event)
@@ -2463,8 +2497,9 @@ rm -- "$0"   # self-delete
         self._set_status("Typing what you pasted…")
 
     @objc.python_method
-    def _run_typing(self, text, countdown):
-        """Start a run: countdown seconds first (0 = start right away)."""
+    def _run_typing(self, text, countdown, kb=None):
+        """Start a run: countdown seconds first (0 = start right away). `kb` is
+        where keystrokes go: the real keyboard unless given (the tour's box)."""
         wpm = self._current_wpm
         mistake_rate = self._typo_rate()
 
@@ -2473,7 +2508,7 @@ rm -- "$0"   # self-delete
         # Build the typing engine + its step generator.  All keystrokes fire on
         # the main run loop (countdownTick: → typeStep:) — TSM requires main thread.
         self.typist = ht.Typist(
-            ht._CTypesKeyboard(), self.state, 60.0 / (wpm * 5.0), mistake_rate)
+            kb or ht._CTypesKeyboard(), self.state, 60.0 / (wpm * 5.0), mistake_rate)
         self._typing_gen = self.typist.steps(text)
         self._countdown_left = countdown
         # Progress tracking: count how many generator steps the text would take
@@ -2803,22 +2838,11 @@ rm -- "$0"   # self-delete
         # HumanType itself is frontmost (the countdown ran out before you clicked
         # away, or you clicked its window): keys would land in its own text box,
         # so wait until another app has focus again.
-        app = NSApplication.sharedApplication()
-        if self._practice_run:
-            # The tour's run types into HumanType's own practice box, so it
-            # needs the opposite: HumanType frontmost with that box focused.
-            blocked = not (app.isActive() and self.window.isKeyWindow())
-            if not blocked and self._onboarding is not None:
-                tv = self._onboarding.practice_tv
-                if self.window.firstResponder() != tv:
-                    self.window.makeFirstResponder_(tv)
-        else:
-            blocked = app.isActive()
-        if blocked:
+        # (The tour's practice run writes into its own box, so it never waits.)
+        if not self._practice_run and NSApplication.sharedApplication().isActive():
             if not self._holding:
                 self._holding = True
-                self._set_status("Click back into the tour to keep typing…" if self._practice_run
-                                 else "Click where you want it typed…")
+                self._set_status("Click where you want it typed…")
             self._schedule(b"typeStep:", 0.12)
             return
         if self._holding:
