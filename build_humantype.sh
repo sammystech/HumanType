@@ -35,8 +35,21 @@ echo "==> Sanity check: engine + UI import and construct"
 echo "==> Cleaning previous build"
 rm -rf build dist
 
+# App icon: assets/AppIcon.icon is an Icon Composer document (layered, with
+# the Liquid Glass light/dark/tinted/clear looks). actool compiles it into
+# Assets.car for macOS 26+ and an .icns fallback, which the spec uses.
+echo "==> Compiling the app icon (Icon Composer)"
+mkdir -p build/icon
+xcrun actool assets/AppIcon.icon --compile build/icon --platform macosx \
+  --minimum-deployment-target 13.0 --app-icon AppIcon \
+  --output-partial-info-plist build/icon/partial.plist >/dev/null
+cp build/icon/AppIcon.icns HumanType.icns
+
 echo "==> Building app bundle with PyInstaller"
 "$VENV/bin/pyinstaller" --noconfirm HumanType.spec
+cp build/icon/Assets.car "$APP/Contents/Resources/Assets.car"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleIconName AppIcon" "$APP/Contents/Info.plist"
 
 SDK=$(otool -l "$EXE" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="sdk"{print $2; exit}')
 if [ "${SDK%%.*}" -lt 26 ]; then

@@ -1,0 +1,43 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.15686,0.11765,0.08627,1.00000",
+          "display-p3:0.02353,0.02353,0.02745,1.00000"
+        ],
+        "orientation": { "start": { "x": 0.5, "y": 0 }, "stop": { "x": 0.5, "y": 1 } }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.12941,0.09804,0.07059,1.00000",
+          "display-p3:0.01569,0.01569,0.01961,1.00000"
+        ],
+        "orientation": { "start": { "x": 0.5, "y": 0 }, "stop": { "x": 0.5, "y": 1 } }
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "Mark",
+      "layers": [
+        { "name": "Caret", "image-name": "Caret.svg", "glass": false },
+        { "name": "Keycap", "image-name": "Keycap.svg", "glass": true, "opacity": 0.16 }
+      ],
+      "shadow": { "kind": "neutral", "opacity": 0.5 },
+      "translucency": { "enabled": true, "value": 0.35 }
+    },
+    {
+      "name": "Glow",
+      "layers": [
+        { "name": "Glow", "image-name": "Glow.svg", "glass": false }
+      ],
+      "shadow": { "kind": "none", "opacity": 0 },
+      "translucency": { "enabled": false, "value": 0 }
+    }
+  ],
+  "supported-platforms": { "squares": "shared" }
+}
