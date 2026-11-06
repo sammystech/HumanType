@@ -37,7 +37,7 @@ class T(NSObject):
         check("HumanType frontmost: nothing typed", NullKB.typed == [])
         check("status asks to click target", "Click where" in str(c.status.stringValue()), str(c.status.stringValue()))
         FakeApp.active = False
-        self.performSelector_withObject_afterDelay_(b"b:", None, 0.4)
+        self.performSelector_withObject_afterDelay_(b"b:", None, 2.5)
     def b_(self, _):
         c = self.c
         n = len(NullKB.typed)

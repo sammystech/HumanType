@@ -1436,6 +1436,8 @@ class Onboarding(NSObject):
         trusted = c._is_trusted()
         if c._tap is None:
             c._install_global_tap()          # works as soon as macOS allows it
+        if c._tap is not None and trusted is False:
+            trusted = True
         # The tap is the real test: macOS often keeps reporting "not trusted"
         # to an app until it restarts, even with the switch on.
         opened = self._settings_opened_at and time.time() - self._settings_opened_at > 4
@@ -1448,8 +1450,11 @@ class Onboarding(NSObject):
                 self._perm_ok.setStringValue_("✓ Allowed")
                 self._perm_note.setStringValue_("")
             elif state == "reopen":
-                self._perm_detail.setStringValue_("Switched it on? Reopen to apply it.")
-                self._perm_btn.setTitle_("Reopen HumanType")
+                stale = c._just_relaunched
+                self._perm_detail.setStringValue_(
+                    "Still blocked: the switch is from an older copy." if stale
+                    else "Switched it on? Reopen to apply it.")
+                self._perm_btn.setTitle_("Fix permission" if stale else "Reopen HumanType")
                 self._perm_btn.setHidden_(False)
                 self._perm_ok.setStringValue_("")
                 self._perm_note.setStringValue_(
@@ -1467,7 +1472,12 @@ class Onboarding(NSObject):
 
     def permAction_(self, sender):
         c = self.ctrl
-        if self._perm_state == "reopen":
+        if self._perm_state == "reopen" and c._just_relaunched:
+            # Already reopened and still blocked: the switch is a stale one.
+            c._fix_permission()
+            self._settings_opened_at = time.time()
+            c._just_relaunched = False
+        elif self._perm_state == "reopen":
             NSUserDefaults.standardUserDefaults().setObject_forKey_("permission", "ht_resume_tour")
             c._relaunch()
         else:
@@ -2921,19 +2931,19 @@ rm -- "$0"   # self-delete
             self._set_status("Nothing to type — paste some text first.")
             return
 
-        if not self._is_trusted():
+        if not self._can_type():
             self._save_draft()
             if not self._asked_ax:
+                # First time: the normal macOS ask. Start goes ahead by itself
+                # as soon as the permission is on (no second click needed).
                 self._asked_ax = True
                 self._prompt_accessibility()
+                self._request_post_access()
                 self._open_accessibility_settings()
-                self._set_status("Switch ON HumanType in Accessibility, then click Start again.")
-            elif not self._just_relaunched:
-                self._set_status("Applying permission — reopening HumanType…")
-                self._relaunch()
+                self._set_status("Switch on HumanType in Accessibility. Typing starts by itself once it's on.")
+                self._wait_for_permission(start_when_ready=True)
             else:
-                self._open_accessibility_settings()
-                self._set_status("Still not detected — remove HumanType from Accessibility, reopen, re-add.")
+                self._permission_help()
             return
 
         self._run_typing(text, self._countdown_secs)
@@ -3023,11 +3033,29 @@ rm -- "$0"   # self-delete
         """Whether this app currently has Accessibility permission (no prompt).
         Best-effort: if the check is unavailable, assume True so we never block
         typing on the check itself."""
+        # Two checks: macOS can keep answering "no" to one of them (until a
+        # relaunch) while the other already knows the switch is on.
         try:
             from ApplicationServices import AXIsProcessTrusted
-            return bool(AXIsProcessTrusted())
+            if AXIsProcessTrusted():
+                return True
         except Exception:
             return True
+        try:
+            from Quartz import CGPreflightPostEventAccess
+            return bool(CGPreflightPostEventAccess())
+        except Exception:
+            return False
+
+    @objc.python_method
+    def _can_type(self):
+        """Permission check used before typing: either macOS says yes, or the
+        shortcut tap (which needs the same permission) installs right now."""
+        if self._is_trusted():
+            return True
+        if self._tap is None:
+            self._install_global_tap()
+        return self._tap is not None
 
     @objc.python_method
     def _prompt_accessibility(self):
@@ -3039,6 +3067,73 @@ rm -- "$0"   # self-delete
             AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
         except Exception:
             pass
+
+    @objc.python_method
+    def _request_post_access(self):
+        try:
+            from Quartz import CGRequestPostEventAccess
+            CGRequestPostEventAccess()
+        except Exception:
+            pass
+
+    @objc.python_method
+    def _wait_for_permission(self, start_when_ready, seconds=180):
+        """Poll for the permission; when it turns on, carry on (start typing
+        if that's what was asked) without another click or prompt."""
+        self._perm_wait_token = getattr(self, "_perm_wait_token", 0) + 1
+        token, deadline = self._perm_wait_token, time.time() + seconds
+
+        def poll():
+            if token != self._perm_wait_token:
+                return
+            if self._can_type():
+                self._set_status("Permission is on. You're good to go.", done=True)
+                if start_when_ready and self._typing_gen is None and self._onboarding is None:
+                    self.start_(None)
+                return
+            if time.time() < deadline:
+                NotchUpdatePanel._after(1.0, poll)
+        NotchUpdatePanel._after(1.0, poll)
+
+    @objc.python_method
+    def _permission_help(self):
+        """Start was pressed again and macOS still refuses. Usually the switch
+        in Settings belongs to an older copy of HumanType (macOS ties it to the
+        app's signature), so it shows ON but doesn't apply. Offer the fix."""
+        from AppKit import NSAlert
+        a = NSAlert.alloc().init()
+        a.setMessageText_("HumanType can't type yet")
+        a.setInformativeText_(
+            "If HumanType is already switched on in Privacy & Security → Accessibility, "
+            "macOS is holding a permission from an older copy of the app.\n\n"
+            "Fix permission clears that old entry and asks again: switch HumanType on "
+            "once more and typing starts by itself.")
+        a.addButtonWithTitle_("Fix permission")
+        a.addButtonWithTitle_("Reopen HumanType")
+        a.addButtonWithTitle_("Cancel")
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        r = a.runModal()
+        if r == 1000:
+            self._fix_permission(start_when_ready=True)
+        elif r == 1001:
+            self._relaunch()
+
+    @objc.python_method
+    def _fix_permission(self, start_when_ready=False):
+        """Clear HumanType's own (stale) Accessibility entry and ask afresh, so
+        the switch the user turns on belongs to this copy of the app."""
+        bid = str(NSBundle.mainBundle().bundleIdentifier() or "com.humantype.app")
+        for service in ("Accessibility", "PostEvent"):
+            try:
+                subprocess.run(["/usr/bin/tccutil", "reset", service, bid],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+        self._prompt_accessibility()
+        self._request_post_access()
+        self._open_accessibility_settings()
+        self._set_status("Switch HumanType on again in Accessibility. Typing starts by itself once it's on.")
+        self._wait_for_permission(start_when_ready)
 
     @objc.python_method
     def _save_draft(self):
