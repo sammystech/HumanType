@@ -68,14 +68,16 @@ MOD_MASK = (kCGEventFlagMaskControl | kCGEventFlagMaskAlternate
             | kCGEventFlagMaskCommand | kCGEventFlagMaskShift)
 
 # A "binding" is a (keycode, modifier_mask) tuple. mask == 0 means "no modifiers".
+KEY_SLASH = 44
+KEY_F6 = 97
+# Defaults (since 1.5.2): ⌘S starts and stops, ` pauses, F6 (the moon key on
+# Apple-silicon MacBooks) locks the keyboard, ⌘⌥V types the clipboard.
 DEFAULT_PAUSE_BINDING = (KEY_BACKTICK, 0)
-DEFAULT_STOP_BINDING = (KEY_Q, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
-# Ctrl+Alt+S — starts typing when idle, stops it when running.
-DEFAULT_START_STOP_BINDING = (KEY_S, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
-# Ctrl+Alt+L — locks/unlocks the physical keyboard (auto-typed keys still flow).
-DEFAULT_LOCK_BINDING = (KEY_L, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
-# Ctrl+Alt+V — types out the clipboard text into the focused app (⌘V still pastes).
-DEFAULT_TYPE_PASTE_BINDING = (KEY_V, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
+DEFAULT_START_STOP_BINDING = (KEY_S, kCGEventFlagMaskCommand)
+# Stop shares ⌘S with Start/Stop (which is checked first, so it stops a run).
+DEFAULT_STOP_BINDING = DEFAULT_START_STOP_BINDING
+DEFAULT_LOCK_BINDING = (KEY_F6, 0)
+DEFAULT_TYPE_PASTE_BINDING = (KEY_V, kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate)
 
 
 # Rough QWERTY neighbors, used to make simulated typos look plausible.

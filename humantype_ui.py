@@ -20,6 +20,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -1348,6 +1349,7 @@ class Onboarding(NSObject):
                                    gray=True, align=NSTextAlignmentCenter)
         self.stage.addSubview_(self._perm_note)
         self._perm_state = None
+        self._settings_opened_at = getattr(self, "_settings_opened_at", None)
         self._perm_poll(self._token)
 
     @objc.python_method
@@ -1356,9 +1358,12 @@ class Onboarding(NSObject):
             return
         c = self.ctrl
         trusted = c._is_trusted()
-        if trusted and c._tap is None:
-            c._install_global_tap()          # often works straight away
-        state = "ok" if trusted and c._tap is not None else ("reopen" if trusted else "off")
+        if c._tap is None:
+            c._install_global_tap()          # works as soon as macOS allows it
+        # The tap is the real test: macOS often keeps reporting "not trusted"
+        # to an app until it restarts, even with the switch on.
+        opened = self._settings_opened_at and time.time() - self._settings_opened_at > 4
+        state = "ok" if c._tap is not None else ("reopen" if trusted or opened else "off")
         if state != self._perm_state:
             self._perm_state = state
             if state == "ok":
@@ -1366,15 +1371,14 @@ class Onboarding(NSObject):
                 self._perm_btn.setHidden_(True)
                 self._perm_ok.setStringValue_("✓ Allowed")
                 self._perm_note.setStringValue_("")
-                self._primary.setEnabled_(True)
             elif state == "reopen":
-                self._perm_detail.setStringValue_("Switched on. macOS needs a restart to apply it.")
+                self._perm_detail.setStringValue_("Switched it on? Reopen to apply it.")
                 self._perm_btn.setTitle_("Reopen HumanType")
                 self._perm_btn.setHidden_(False)
                 self._perm_ok.setStringValue_("")
                 self._perm_note.setStringValue_(
-                    "HumanType will quit and open again right here, at this step.")
-                self._primary.setEnabled_(False)
+                    "macOS often needs HumanType to restart before it notices. "
+                    "It reopens right here, at this step.")
             else:
                 self._perm_detail.setStringValue_("Not allowed yet.")
                 self._perm_btn.setTitle_("Open Settings")
@@ -1383,7 +1387,6 @@ class Onboarding(NSObject):
                 self._perm_note.setStringValue_(
                     "In Privacy & Security → Accessibility, switch on HumanType. "
                     "This screen updates by itself.")
-                self._primary.setEnabled_(False)
         NotchUpdatePanel._after(1.0, lambda: self._perm_poll(token))
 
     def permAction_(self, sender):
@@ -1392,6 +1395,7 @@ class Onboarding(NSObject):
             NSUserDefaults.standardUserDefaults().setObject_forKey_("permission", "ht_resume_tour")
             c._relaunch()
         else:
+            self._settings_opened_at = time.time()
             c._prompt_accessibility()
             c._open_accessibility_settings()
 
@@ -3226,7 +3230,10 @@ rm -- "$0"   # self-delete
                 return None
             # Reject a combo already assigned to another action — otherwise the
             # tap's first-match-wins order would silently disable one of them.
-            taken = {k: v for k, v in self._bindings().items() if k != which}
+            # (Start/Stop and Stop may share one: ⌘S starts and stops.)
+            share = {"start_stop", "stop"}
+            taken = {k: v for k, v in self._bindings().items()
+                     if k != which and not (which in share and k in share)}
             if binding in taken.values():
                 button.setTitle_(prev_label)
                 self._set_status("That shortcut is already in use — pick another.")
