@@ -78,6 +78,11 @@ DEFAULT_START_STOP_BINDING = (KEY_S, kCGEventFlagMaskCommand)
 DEFAULT_STOP_BINDING = DEFAULT_START_STOP_BINDING
 DEFAULT_LOCK_BINDING = (KEY_F6, 0)
 DEFAULT_TYPE_PASTE_BINDING = (KEY_V, kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate)
+# Self-destruct (stop, unlock, wipe the unsaved text, quit): hold ⌃⌥⌘ together.
+# Keycode -1 means "these modifiers alone", held briefly with no other key.
+KEY_MODS_ONLY = -1
+DEFAULT_DESTRUCT_BINDING = (KEY_MODS_ONLY, kCGEventFlagMaskControl | kCGEventFlagMaskAlternate
+                            | kCGEventFlagMaskCommand)
 
 
 # Rough QWERTY neighbors, used to make simulated typos look plausible.
@@ -260,6 +265,8 @@ class Typist:
         self.fatigue = 1.0       # slow random-walk of overall tempo
         self.tempo = 1.0         # phrase-level wave: stretches of fast / slow typing
         self.word_factor = 1.0   # per-word speed multiplier (typing in bursts)
+        self.variation = 0.50    # spread of key-to-key timing (fraction of base)
+        self.pause_rate = 0.012  # chance of a mid-stream "thinking" hesitation per key
 
     # --- low-level emission -------------------------------------------------
 
@@ -295,7 +302,7 @@ class Typist:
 
     def _char_pause(self, ch):
         self._drift()
-        d = max(0.0, random.gauss(self.base, self.base * 0.50))
+        d = max(0.0, random.gauss(self.base, self.base * self.variation))
         d *= self.fatigue * self.word_factor * self.tempo
         # Boundary pauses (not scaled — these are cognitive, not motor).
         if ch in ".!?":
@@ -307,7 +314,7 @@ class Typist:
         elif ch == " ":
             d += random.uniform(0.0, 0.08)
         # Rare mid-stream "thinking" hesitation.
-        if random.random() < 0.012:
+        if random.random() < self.pause_rate:
             d += random.uniform(0.4, 1.4)
         return d
 

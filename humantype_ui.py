@@ -16,6 +16,7 @@ build_humantype.sh checks that for the bundle."""
 import json
 import math
 import os
+import random
 import ssl
 import subprocess
 import sys
@@ -112,6 +113,7 @@ from Quartz import (
     kCGEventFlagMaskCommand,
     kCGEventFlagMaskControl,
     kCGEventFlagMaskShift,
+    kCGEventFlagsChanged,
     kCGEventKeyDown,
     kCGEventTapDisabledByTimeout,
     kCGEventTapDisabledByUserInput,
@@ -637,6 +639,7 @@ TOP = H - 64        # top of the page area, just under the floating tab bar
 TABS = (
     ("Type",     "keyboard",         "type",     b"showTabType:"),
     ("Snippets", "doc.on.clipboard", "snippets", b"showTabSnippets:"),
+    ("Calibrate", "waveform", "calibrate", b"showTabCalibrate:"),
     ("Settings", "gearshape",        "settings", b"showTabSettings:"),
 )
 
@@ -647,7 +650,47 @@ REALISM = {
     "Minimal":  (0.00, 0.60, False),
     "Natural":  (0.02, 1.00, True),
     "Pro":      (0.04, 1.25, True),
+    "You":      (0.02, 1.00, True),     # filled in by Calibrate (ht_calibration)
 }
+
+CALIBRATE_PROMPTS = (
+    "Describe a place you'd love to go back to, and why it stuck with you.",
+    "Write about a skill you picked up recently and how you learned it.",
+    "Tell the story of a small win you had this week.",
+    "Explain how you'd spend a perfect free Saturday.",
+    "Describe something you changed your mind about, and what did it.",
+)
+CALIBRATE_KEYS = 120        # keystrokes before the first match
+
+
+def calibration_from_keys(events, final_text):
+    """events: [(time, keycode)] of key presses while calibrating. Returns the
+    measured profile, or None if there isn't enough typing yet."""
+    if len(events) < CALIBRATE_KEYS:
+        return None
+    gaps = [b[0] - a[0] for a, b in zip(events, events[1:])]
+    active = [g for g in gaps if g <= 3.0]              # longer = stepped away
+    if not active:
+        return None
+    keys = [g for g in active if g <= 1.0]
+    mean_key = sum(keys) / len(keys) if keys else 0.2
+    var = (sum((g - mean_key) ** 2 for g in keys) / len(keys)) ** 0.5 if keys else 0.1
+    letters = max(1, sum(1 for _, kc in events if kc != 51))
+    corrections, prev = 0, None
+    for _, kc in events:                                # a run of ⌫ = one fix
+        if kc == 51 and prev != 51:
+            corrections += 1
+        prev = kc
+    minutes = sum(active) / 60.0
+    wpm = (len(final_text) / 5.0) / minutes if minutes > 0 else 40
+    return {
+        "wpm": int(max(10, min(200, round(wpm)))),
+        "avg_key": round(mean_key, 3),
+        "variation": round(max(0.2, min(0.9, var / mean_key if mean_key else 0.5)), 3),
+        "pause_rate": round(max(0.0, min(0.08, sum(1 for g in active if g > 1.0) / len(active))), 4),
+        "typo": round(max(0.0, min(0.12, corrections / letters)), 4),
+        "corrections": corrections,
+    }
 
 # US-ANSI virtual key codes -> printable label, for showing the chosen binds.
 KEYNAMES = {
@@ -658,7 +701,7 @@ KEYNAMES = {
     34: "I", 35: "P", 36: "Return", 37: "L", 38: "J", 39: "'", 40: "K",
     41: ";", 42: "\\", 43: ",", 44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab",
     49: "Space", 50: "` (backtick)", 51: "Delete", 53: "Esc", 65: ".", 67: "*", 69: "+",
-    75: "/", 76: "Enter", 122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5",
+    -1: "", 75: "/", 76: "Enter", 122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5",
     97: "F6", 98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12", 78: "-", 123: "←", 124: "→", 125: "↓", 126: "↑",
 }
 
@@ -674,7 +717,7 @@ DND_AS_F6 = ('{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x10000009B,'
 # Bindings that act in every app even when idle, and the modifiers they need.
 # Lock isn't here: a bare lock key (Tab) is fine because it only acts during a
 # run or while locked (see _lock_live), so it types normally the rest of the time.
-ALWAYS_ON = ("start_stop", "type_paste")
+ALWAYS_ON = ("start_stop", "type_paste", "destruct")
 HOTKEY_MODS = (ht.kCGEventFlagMaskCommand | ht.kCGEventFlagMaskControl
                | ht.kCGEventFlagMaskAlternate)
 
@@ -1050,6 +1093,27 @@ class KeyboardView(NSView):
             y += key_h + gap
 
 
+class _CountingKeyboard:
+    """Wraps the keyboard a run types through and counts what it emits, so
+    key-by-key mode can step past the engine's pause-only steps (a hesitation
+    before a word, noticing a typo) and always type something per press."""
+
+    def __init__(self, kb):
+        self.kb = kb
+        self.count = 0
+
+    def type(self, ch):
+        self.count += 1
+        self.kb.type(ch)
+
+    def press(self, key):
+        self.count += 1
+        self.kb.press(key)
+
+    def release(self, key):
+        self.kb.release(key)
+
+
 class _ViewKeyboard:
     """The tour's keyboard: the real typing engine (speed, pauses, typos and
     their fixes) writes straight into the practice box, so it types the moment
@@ -1116,20 +1180,24 @@ class Onboarding(NSObject):
         ("pause", "pause.fill", "Pause and resume",
          "Press {pause} to pause. Press it again to carry on where it left off."),
         ("lock", "lock.fill", "Lock your keyboard",
-         "Press {lock} to lock your keyboard, then mash any keys you like: nothing gets "
-         "through, only HumanType's typing does. Press {lock} again to unlock."),
+         "{lock_body}"),
         ("stop", "stop.fill", "Stop anytime",
          "Press {start_stop} again to stop typing straight away. The same shortcut "
          "starts and stops."),
         ("type_paste", "doc.on.doc", "Type what you copied",
          "Copy some text, then press {type_paste}: HumanType types it right where "
          "you're typing, in any app. ⌘V still pastes like normal."),
+        ("destruct", "flame.fill", "Self-destruct",
+         "Need it gone fast? Hold {destruct} together for a moment: HumanType stops, "
+         "wipes the text you haven't saved and quits on the spot. Try it here, it "
+         "won't quit."),
         ("done", "checkmark", "You're all set",
          "Change the speed, realism and every shortcut in Settings. You can replay "
          "this tour anytime from the HumanType menu in the menu bar."),
     )
     KEY_STEPS = {"start": ("start_stop",), "pause": ("pause",), "lock": ("lock",),
-                 "stop": ("start_stop",), "type_paste": ("type_paste",)}
+                 "stop": ("start_stop",), "type_paste": ("type_paste",),
+                 "destruct": ("destruct",)}
 
     def initWithController_(self, ctrl):
         self = objc.super(Onboarding, self).init()
@@ -1227,6 +1295,14 @@ class Onboarding(NSObject):
             v.removeFromSuperview()
         shortcuts = {k: binding_label(b) for k, b in c._bindings().items()}
         shortcuts["countdown"] = c._countdown_secs
+        shortcuts["lock_body"] = (
+            f"Press {shortcuts['lock']} to lock it. Now every key you press types the next "
+            f"letter of your text, whatever the key. Press {shortcuts['lock']} again to "
+            "unlock: typing pauses and your keyboard is yours."
+            if c._mash_mode else
+            f"Press {shortcuts['lock']} to lock your keyboard, then mash any keys you like: "
+            f"nothing gets through, only HumanType's typing does. Press {shortcuts['lock']} "
+            "again to unlock.")
         # Text-only screens sit in the middle; the rest leave room below.
         top = H - 56 - (140 if key in ("welcome", "done") else 0)
         if key in self.KEY_STEPS:
@@ -1274,9 +1350,9 @@ class Onboarding(NSObject):
         if key in self.KEY_STEPS:
             self.stage.addSubview_(self.feedback)
         self._ran_this_step = False
-        if key in ("pause", "lock", "stop") and c._typing_gen is None:
+        if key in ("pause", "lock", "stop", "destruct"):
             token = self._token
-            NotchUpdatePanel._after(0.6, lambda: token == self._token
+            NotchUpdatePanel._after(0.6, lambda: token == self._token and c._typing_gen is None
                                     and not self._ran_this_step and self.start_practice())
         elif c._practice_run and self.practice_visible():
             self.view.window().makeFirstResponder_(self.practice_tv)
@@ -1492,8 +1568,12 @@ class Onboarding(NSObject):
             "start": "It's typing. Nice!",
             "pause": f"Paused. Press {keys['pause']} again to resume.",
             "resume": "Typing again, right where it stopped.",
-            "lock": f"Locked. Mash some keys: nothing gets through. {keys['lock']} unlocks.",
-            "unlock": f"Unlocked. {n} key{'s' if n != 1 else ''} blocked.",
+            "lock": (f"Locked. Press any keys: each one types the next letter. {keys['lock']} unlocks."
+                     if self.ctrl._mash_mode else
+                     f"Locked. Mash some keys: nothing gets through. {keys['lock']} unlocks."),
+            "unlock": (f"Unlocked: typing paused, your keyboard is back. ({n} key{'s' if n != 1 else ''})"
+                       if self.ctrl._mash_mode else
+                       f"Unlocked. {n} key{'s' if n != 1 else ''} blocked."),
             "stop": f"Stopped. {keys['start_stop']} starts it again.",
             "done": f"Complete. {keys['start_stop']} types it again.",
             "type_paste": "It's typing what you copied.",
@@ -1512,11 +1592,26 @@ class Onboarding(NSObject):
             NotchUpdatePanel._after(1.2, lambda: token == self._token and self.start_practice())
 
     @objc.python_method
+    def demo_destruct(self):
+        """Self-destruct on its own tour page: do everything but quit."""
+        c = self.ctrl
+        self._token += 1                # no restart, no auto-advance from "stop"
+        if c.state is not None and c._typing_gen is not None:
+            c.state.stop()
+            c._finish(False)
+        self.practice_tv.setString_("")
+        self.practice_hint.setHidden_(True)
+        self.feedback.setStringValue_("Wiped. For real, HumanType would also quit right now.")
+        self._advance_later(2.6)
+
+    @objc.python_method
     def blocked_key(self):
         self._blocked += 1
+        n = self._blocked
         if getattr(self, "feedback", None) is not None:
+            verb = "typed it letter by letter" if self.ctrl._mash_mode else "blocked"
             self.feedback.setStringValue_(
-                f"Locked · {self._blocked} key{'s' if self._blocked != 1 else ''} blocked. "
+                f"Locked · {n} key{'s' if n != 1 else ''} {verb}. "
                 f"{binding_label(self.ctrl.lock_binding)} unlocks.")
 
 
@@ -1542,6 +1637,7 @@ class AppController(NSObject):
         self._from_window = False   # the run was started with Start, not ⌃⌥V
         self._practice_run = False  # the tour's run, typing into its practice box
         self._dnd_remapped = False  # moon key currently sending F6 (see DND_AS_F6)
+        self._chord_armed = False   # ⌃⌥⌘ held, self-destruct pending (see the tap)
         self._monitor = None
         self._record_button = None  # button currently awaiting a key press
         self._record_which = None   # which binding is being recorded
@@ -1558,6 +1654,8 @@ class AppController(NSObject):
         self.lock_binding = self._load_binding(d, "lock", ht.DEFAULT_LOCK_BINDING)
         self.type_paste_binding = self._load_binding(
             d, "type_paste", ht.DEFAULT_TYPE_PASTE_BINDING)
+        self.destruct_binding = self._load_binding(
+            d, "destruct", ht.DEFAULT_DESTRUCT_BINDING)
         self._kbd_locked = False
         # Settings (loaded fresh from defaults each time, saved on change)
         self._current_wpm       = int(d.integerForKey_("ht_wpm") or 55)
@@ -1566,7 +1664,12 @@ class AppController(NSObject):
         if self._countdown_secs < 1: self._countdown_secs = 5
         self._realism_name      = d.stringForKey_("ht_realism") or "Natural"
         if self._realism_name not in REALISM: self._realism_name = "Natural"
+        if self._realism_name == "You" and not d.dictionaryForKey_("ht_calibration"):
+            self._realism_name = "Natural"
         self._auto_paste        = bool(d.boolForKey_("ht_auto_paste"))
+        # Key-by-key: while locked, each key press types the next letter (on by default).
+        self._mash_mode = (True if d.objectForKey_("ht_mash_mode") is None
+                           else bool(d.boolForKey_("ht_mash_mode")))
         self._strip_fmt         = bool(d.boolForKey_("ht_strip_fmt"))
         # Text progress tracking
         self._total_steps = 0
@@ -1988,6 +2091,8 @@ rm -- "$0"   # self-delete
         self._build_type_page(self._tab_type)
         self._tab_snippets = self._page(root)
         self._build_snippets_page(self._tab_snippets)
+        self._tab_calibrate = self._page(root)
+        self._build_calibrate_page(self._tab_calibrate)
         self._tab_settings = self._page(root)
         self._build_settings_panel(self._tab_settings)
         self._build_tab_bar(root)
@@ -2129,11 +2234,11 @@ rm -- "$0"   # self-delete
                                   size=13, weight=NSFontWeightMedium))
         self._realism_seg = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
             list(REALISM), 0, self, b"realismChanged:")   # 0 = select-one
-        self._realism_seg.setFrame_(NSMakeRect(96, 11, 250, 26))
+        self._realism_seg.setFrame_(NSMakeRect(96, 11, 300, 26))
         self._realism_seg.setSelectedSegmentBezelColor_(_rgb(1, 1, 1, 0.2))
         c.addSubview_(self._realism_seg)
         self._realism_hint = self._label(
-            "", NSMakeRect(cw - 188, 15, 170, 18), size=12, gray=True,
+            "", NSMakeRect(cw - 160, 15, 142, 18), size=12, gray=True,
             align=NSTextAlignmentRight)
         c.addSubview_(self._realism_hint)
         self._sync_realism()
@@ -2226,13 +2331,128 @@ rm -- "$0"   # self-delete
             NSMakeRect(W - M - 190, 22, 190, 36), symbol="plus", size=13))
         self._rebuild_snippet_list("")
 
+    # ── Calibrate page ───────────────────────────────────────────────────
+
+    @objc.python_method
+    def _build_calibrate_page(self, cp):
+        self._page_title(cp, "Calibrate", "Tuned to your hands, not a preset.")
+        cw = W - 2 * M
+        top = TOP - 76
+        self._label_into(cp, "TYPE NATURALLY FOR A MINUTE", NSMakeRect(M + 2, top - 2, cw, 14),
+                         size=10.5, weight=NSFontWeightSemibold, color=THEME_ACCENT)
+        self._calib_prompt = NSTextField.wrappingLabelWithString_(random.choice(CALIBRATE_PROMPTS))
+        self._calib_prompt.setFrame_(NSMakeRect(M + 2, top - 46, cw - 4, 38))
+        self._calib_prompt.setFont_(NSFont.systemFontOfSize_(13.5))
+        self._calib_prompt.setTextColor_(NSColor.secondaryLabelColor())
+        cp.addSubview_(self._calib_prompt)
+        ch = 370
+        card, cc = glass_panel(NSMakeRect(M, top - 58 - ch, cw, ch), radius=16)
+        cp.addSubview_(card)
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 12, cw - 24, ch - 24))
+        scroll.setDrawsBackground_(False)
+        scroll.setBorderType_(0)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        tv = NSTextView.alloc().initWithFrame_(scroll.contentView().bounds())
+        tv.setRichText_(False)
+        tv.setDrawsBackground_(False)
+        tv.setFont_(NSFont.monospacedSystemFontOfSize_weight_(14, NSFontWeightRegular))
+        tv.setTextColor_(NSColor.labelColor())
+        tv.setInsertionPointColor_(THEME_ACCENT)
+        tv.setTextContainerInset_((6, 8))
+        tv.setVerticallyResizable_(True)
+        tv.setAutomaticQuoteSubstitutionEnabled_(False)
+        tv.setAutomaticDashSubstitutionEnabled_(False)
+        tv.setAutomaticTextReplacementEnabled_(False)
+        tv.setAutomaticSpellingCorrectionEnabled_(False)
+        scroll.setDocumentView_(tv)
+        cc.addSubview_(scroll)
+        self._calib_tv = tv
+        sy = top - 58 - ch - 46
+        self._calib_status = self._label("", NSMakeRect(M + 2, sy, cw - 150, 36), size=12,
+                                         color=NSColor.systemGreenColor())
+        self._calib_status.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.5, NSFontWeightRegular))
+        self._calib_status.setMaximumNumberOfLines_(2)
+        cp.addSubview_(self._calib_status)
+        cp.addSubview_(self._glass_button("Start over", b"calibReset:",
+                                          NSMakeRect(W - M - 130, sy + 4, 130, 32), size=12))
+        self._calib_events = []
+        self._calib_monitor = None
+        cal = self._calibration()
+        self._calib_status.setStringValue_(
+            self._calib_summary(cal) if cal else f"Type at least {CALIBRATE_KEYS} keys. "
+            "Mistakes and fixes count too.")
+
+    @objc.python_method
+    def _label_into(self, parent, text, rect, **kw):
+        lbl = self._label(text, rect, **kw)
+        parent.addSubview_(lbl)
+        return lbl
+
+    @objc.python_method
+    def _calibration(self):
+        cal = NSUserDefaults.standardUserDefaults().dictionaryForKey_("ht_calibration")
+        return dict(cal) if cal else None
+
+    @objc.python_method
+    def _calib_summary(self, cal):
+        return (f"matched! ~{cal['wpm']} wpm, avg {cal['avg_key']:.2f}s/key, "
+                f"{cal['corrections']} corrections.\n\"You\" is now tuned to you, applied immediately.")
+
+    @objc.python_method
+    def _calib_listen(self, on):
+        """Record key-press timing only while the Calibrate page is showing."""
+        if on and self._calib_monitor is None:
+            def handler(event):
+                if self.window.firstResponder() == self._calib_tv:
+                    self._calib_key(time.time(), int(event.keyCode()))
+                return event
+            self._calib_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, handler)
+        elif not on and self._calib_monitor is not None:
+            NSEvent.removeMonitor_(self._calib_monitor)
+            self._calib_monitor = None
+
+    @objc.python_method
+    def _calib_key(self, t, keycode):
+        self._calib_events.append((t, keycode))
+        n = len(self._calib_events)
+        if n < CALIBRATE_KEYS:
+            self._calib_status.setStringValue_(f"Keep going… {n}/{CALIBRATE_KEYS} keys")
+            return
+        if n != CALIBRATE_KEYS and n % 10:
+            return                       # refine every 10 keys after the first match
+        # The text view updates after the key event, so read it a beat later.
+        self.performSelector_withObject_afterDelay_(b"calibApply:", None, 0.05)
+
+    def calibApply_(self, _):
+        cal = calibration_from_keys(self._calib_events, str(self._calib_tv.string()))
+        if not cal:
+            return
+        d = NSUserDefaults.standardUserDefaults()
+        d.setObject_forKey_(cal, "ht_calibration")
+        self._realism_name = "You"
+        d.setObject_forKey_("You", "ht_realism")
+        d.removeObjectForKey_("ht_typo_override")
+        self._apply_wpm(cal["wpm"])
+        self._sync_realism()
+        self._calib_status.setStringValue_(self._calib_summary(cal))
+
+    def calibReset_(self, sender):
+        self._calib_events = []
+        self._calib_tv.setString_("")
+        self._calib_prompt.setStringValue_(random.choice(CALIBRATE_PROMPTS))
+        self._calib_status.setStringValue_(f"Type at least {CALIBRATE_KEYS} keys. "
+                                           "Mistakes and fixes count too.")
+        self.window.makeFirstResponder_(self._calib_tv)
+
     # ── Settings page ────────────────────────────────────────────────────
 
     @objc.python_method
     def _build_settings_panel(self, st):
         self._page_title(st, "Settings", "Tune the typing and set your global shortcuts.")
         y = TOP - 72                     # top of the next section
-        cw, row_h = W - 2*M, 38
+        cw, row_h = W - 2*M, 35
 
         def card(title, n_rows):
             """Section header + inset-grouped glass card; returns (content, h)."""
@@ -2243,7 +2463,7 @@ rm -- "$0"   # self-delete
             st.addSubview_(panel)
             for i in range(1, n_rows):
                 self._separator(c, 16, h - i * row_h, cw - 32)
-            y -= 20 + h + 14
+            y -= 20 + h + 10
             return c, h
 
         def row(h, i):                   # local bottom edge of row i (0 = top)
@@ -2274,7 +2494,7 @@ rm -- "$0"   # self-delete
             c.addSubview_(btn)
             return btn
 
-        c, h = card("Typing", 2)
+        c, h = card("Typing", 3)
         self._st_wpm_sl, self._st_wpm_lbl = slider_row(
             c, row(h, 0), "Speed", 10, 200, self._current_wpm,
             lambda v: f"{int(v)} wpm", b"settingsWpmChanged:")
@@ -2283,21 +2503,23 @@ rm -- "$0"   # self-delete
             lambda v: f"{int(v)}s", b"settingsCountdownChanged:")
         self._st_countdown_sl.setAltIncrementValue_(1)
 
-        c, h = card("Realism", 1)
         override = NSUserDefaults.standardUserDefaults().floatForKey_("ht_typo_override")
         self._st_typo_sl, self._st_typo_lbl = slider_row(
-            c, row(h, 0), "Typo rate", 0.0, 0.15, override,
+            c, row(h, 2), "Typo rate", 0.0, 0.15, override,
             _typo_label, b"settingsTypoChanged:")
 
-        c, h = card("Behaviour", 2)
+        c, h = card("Behaviour", 3)
         self._st_auto_paste = switch_row(
             c, row(h, 0), "Auto-paste clipboard text on open",
             self._auto_paste, b"settingsAutoPasteToggled:")
         self._st_strip_fmt = switch_row(
             c, row(h, 1), "Flatten line breaks and extra spaces",
             self._strip_fmt, b"settingsStripFmtToggled:")
+        self._st_mash = switch_row(
+            c, row(h, 2), "While locked, each key press types the next letter",
+            self._mash_mode, b"settingsMashToggled:")
 
-        c, h = card("Shortcuts", 5)
+        c, h = card("Shortcuts", 6)
         self.start_stop_rec = shortcut_row(
             c, row(h, 0), "Start / Stop", self.start_stop_binding, b"recordStartStop:")
         self.pause_rec = shortcut_row(
@@ -2309,10 +2531,13 @@ rm -- "$0"   # self-delete
         self.type_paste_rec = shortcut_row(
             c, row(h, 4), "Type clipboard", self.type_paste_binding,
             b"recordTypePaste:")
+        self.destruct_rec = shortcut_row(
+            c, row(h, 5), "Self-destruct: wipe & quit (hold)", self.destruct_binding,
+            b"recordDestruct:")
 
         self._version_lbl = self._label(
-            f"HumanType {APP_VERSION}", NSMakeRect(M, 18, cw, 16), size=11,
-            dim=True, align=NSTextAlignmentCenter)
+            f"HumanType {APP_VERSION}", NSMakeRect(W - M - 200, TOP - 30, 200, 16), size=11,
+            dim=True, align=NSTextAlignmentRight)
         st.addSubview_(self._version_lbl)
 
     # ── Tab switching ────────────────────────────────────────────────────
@@ -2322,9 +2547,11 @@ rm -- "$0"   # self-delete
         self._active_tab = name
         panels = {"type": self._tab_type,
                   "snippets": self._tab_snippets,
+                  "calibrate": self._tab_calibrate,
                   "settings": self._tab_settings}
         for k, p in panels.items():
             p.setHidden_(k != name)
+        self._calib_listen(name == "calibrate")
         # The current page's header button is white, the others dimmed.
         for k, btn in self._nav_btns.items():
             if k == "settings":
@@ -2340,6 +2567,10 @@ rm -- "$0"   # self-delete
     def showTabSnippets_(self, sender):
         self._show_tab("snippets")
         self._rebuild_snippet_list(str(self._snip_search.stringValue()))
+
+    def showTabCalibrate_(self, sender):
+        self._show_tab("calibrate")
+        self.window.makeFirstResponder_(self._calib_tv)
 
     def showTabSettings_(self, sender):
         self._show_tab("settings")
@@ -2369,7 +2600,15 @@ rm -- "$0"   # self-delete
 
     def realismChanged_(self, sender):
         # Picking a preset takes over from any manual typo rate in Settings.
-        self._realism_name = list(REALISM)[int(sender.selectedSegment())]
+        name = list(REALISM)[int(sender.selectedSegment())]
+        if name == "You" and not self._calibration():
+            self._sync_realism()            # keep the old choice until calibrated
+            self.showTabCalibrate_(None)
+            self._calib_status.setStringValue_("Type here first: \"You\" learns from your typing.")
+            return
+        self._realism_name = name
+        if name == "You":
+            self._apply_wpm(self._calibration()["wpm"])
         d = NSUserDefaults.standardUserDefaults()
         d.setObject_forKey_(self._realism_name, "ht_realism")
         d.removeObjectForKey_("ht_typo_override")
@@ -2384,6 +2623,8 @@ rm -- "$0"   # self-delete
         override = NSUserDefaults.standardUserDefaults().floatForKey_("ht_typo_override")
         if override > 0:
             return override
+        if self._realism_name == "You" and self._calibration():
+            return self._calibration()["typo"]
         return REALISM.get(self._realism_name, REALISM["Natural"])[0]
 
     @objc.python_method
@@ -2407,6 +2648,10 @@ rm -- "$0"   # self-delete
         NSUserDefaults.standardUserDefaults().setFloat_forKey_(rate, "ht_typo_override")
         self._st_typo_lbl.setStringValue_(_typo_label(rate))
         self._sync_realism()
+
+    def settingsMashToggled_(self, sender):
+        self._mash_mode = bool(sender.state())
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(self._mash_mode, "ht_mash_mode")
 
     def settingsAutoPasteToggled_(self, sender):
         self._auto_paste = bool(sender.state())
@@ -2723,11 +2968,16 @@ rm -- "$0"   # self-delete
         mistake_rate = self._typo_rate()
 
         self.state = ht.TypingState()
+        self._kb_counter = _CountingKeyboard(kb or ht._CTypesKeyboard())
 
         # Build the typing engine + its step generator.  All keystrokes fire on
         # the main run loop (countdownTick: → typeStep:) — TSM requires main thread.
         self.typist = ht.Typist(
-            kb or ht._CTypesKeyboard(), self.state, 60.0 / (wpm * 5.0), mistake_rate)
+            self._kb_counter, self.state, 60.0 / (wpm * 5.0), mistake_rate)
+        cal = self._calibration() if self._realism_name == "You" else None
+        if cal:                         # your measured rhythm, not a preset
+            self.typist.variation = cal["variation"]
+            self.typist.pause_rate = cal["pause_rate"]
         self._typing_gen = self.typist.steps(text)
         self._countdown_left = countdown
         # Progress tracking: count how many generator steps the text would take
@@ -2873,8 +3123,23 @@ rm -- "$0"   # self-delete
                 if pid == os.getpid() and flags & HOLD_MODS:
                     CGEventSetFlags(event, flags & ~HOLD_MODS)
                 return event
+            if etype == kCGEventFlagsChanged:
+                # Modifier-only shortcut (self-destruct = ⌃⌥⌘): arm when exactly
+                # those are held, fire if they're still held 0.4s later with no
+                # other key pressed (so ⌃⌥⌘+letter shortcuts elsewhere don't).
+                if self.destruct_binding[0] == ht.KEY_MODS_ONLY and self._monitor is None:
+                    held = int(CGEventGetFlags(event)) & ht.MOD_MASK
+                    if held == self.destruct_binding[1]:
+                        if not self._chord_armed:
+                            self._chord_armed = True
+                            self.performSelector_withObject_afterDelay_inModes_(
+                                b"chordHeld:", None, 0.4, [NSRunLoopCommonModes])
+                    else:
+                        self._chord_armed = False
+                return event          # never swallow modifier changes
             if etype != kCGEventKeyDown:
                 return event
+            self._chord_armed = False     # a real key: not the modifier-only chord
 
             if self._monitor is not None:
                 return event      # recording a shortcut: let the recorder see it
@@ -2907,11 +3172,17 @@ rm -- "$0"   # self-delete
                         b"typePasted:", pasted, 0.0, [NSRunLoopCommonModes])
                     return None
 
+            if key == self.destruct_binding:
+                if not autorepeat:
+                    self.performSelector_withObject_afterDelay_inModes_(
+                        b"selfDestruct:", None, 0.0, [NSRunLoopCommonModes])
+                return None
             if not autorepeat:
                 # Lock toggle — always active, checked first so it works even
                 # while the keyboard is locked.
                 if key == self.lock_binding and self._lock_live():
                     self._kbd_locked = not self._kbd_locked
+                    self._mash_hold_on_unlock()
                     self.performSelector_withObject_afterDelay_inModes_(
                         b"syncLockUI:", None, 0.0, [NSRunLoopCommonModes])
                     return None
@@ -2923,6 +3194,8 @@ rm -- "$0"   # self-delete
                             b"start:", None, 0.0, [NSRunLoopCommonModes])
                     elif self.state is not None:
                         self.state.stop()
+                        self.performSelector_withObject_afterDelay_inModes_(
+                            b"typeStep:", None, 0.0, [NSRunLoopCommonModes])
                     return None   # swallow — never reaches the focused app/site
                 # Pause / emergency-stop only act (and are only swallowed) while
                 # typing, so these keys still work normally elsewhere when idle.
@@ -2933,6 +3206,8 @@ rm -- "$0"   # self-delete
                     return None
                 if typing and key == self.stop_binding:
                     self.state.stop()
+                    self.performSelector_withObject_afterDelay_inModes_(
+                        b"typeStep:", None, 0.0, [NSRunLoopCommonModes])
                     return None
             else:
                 # Autorepeat from HOLDING a hotkey: don't re-fire the action, but
@@ -2948,6 +3223,10 @@ rm -- "$0"   # self-delete
             # can't leak into the document during a take. Mouse is unaffected, so
             # you can always click the menu-bar lock to unlock.
             if self._kbd_locked:
+                if self._mash_mode and typing:
+                    # Key-by-key: this press types the next letter instead.
+                    self.performSelector_withObject_afterDelay_inModes_(
+                        b"mashStep:", None, 0.0, [NSRunLoopCommonModes])
                 if self._onboarding is not None and not autorepeat:
                     self._onboarding.blocked_key()
                 return None
@@ -2957,7 +3236,8 @@ rm -- "$0"   # self-delete
         self._tap_callback = tap_callback
         tap = CGEventTapCreate(
             kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
-            CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp),
+            CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
+            | CGEventMaskBit(kCGEventFlagsChanged),
             tap_callback, None)
         if not tap:
             self._tap = None
@@ -2981,7 +3261,16 @@ rm -- "$0"   # self-delete
 
     def toggleLock_(self, sender):
         self._kbd_locked = not self._kbd_locked
+        self._mash_hold_on_unlock()
         self.syncLockUI_(None)
+
+    @objc.python_method
+    def _mash_hold_on_unlock(self):
+        """Key-by-key mode: unlocking pauses the run in the same instant, so no
+        letter types itself before your keyboard is back."""
+        if (self._mash_mode and not self._kbd_locked and self.state is not None
+                and self._typing_gen is not None and not self.state.paused):
+            self.state.toggle_pause()
 
     def syncLockUI_(self, _):
         """Reflect the keyboard-lock state in the menu, menu-bar icon, status."""
@@ -3013,6 +3302,11 @@ rm -- "$0"   # self-delete
             self._set_status("Keyboard unlocked.")
             if hasattr(self, "_lock_lbl"):
                 self._lock_lbl.setStringValue_("")
+        if (self._mash_mode and self.state is not None and self._typing_gen is not None
+                and not self._kbd_locked and self.state.paused):
+            self._set_pause_btn(True)   # key-by-key off: the run is held, type freely
+            self._set_status("Paused. Lock again to keep typing key by key.")
+            self._set_chip("Paused", NSColor.systemOrangeColor())
         self._sync_dnd_remap()
         if self._onboarding is not None:
             self._onboarding.event("lock" if self._kbd_locked else "unlock")
@@ -3062,7 +3356,8 @@ rm -- "$0"   # self-delete
         if self.state.stopped:
             self._finish(False)
             return
-        if self.state.paused:
+        if self.state.paused or (self._kbd_locked and self._mash_mode):
+            # Paused, or key-by-key: each key press advances it (mashStep:).
             self._schedule(b"typeStep:", 0.12)
             return
         # HumanType itself is frontmost (the countdown ran out before you clicked
@@ -3133,6 +3428,39 @@ rm -- "$0"   # self-delete
         if self._update_waiting:
             self._presentUpdate_(None)
 
+    def mashStep_(self, _):
+        """Key-by-key mode: a physical key press while locked types exactly one
+        keystroke of the text (the engine's next step, typos and fixes included)."""
+        if self._typing_gen is None or self.state is None or self.state.stopped:
+            return
+        if not self._practice_run and NSApplication.sharedApplication().isActive():
+            return                      # never type into HumanType's own window
+        if self.state.paused:
+            self.state.toggle_pause()
+            self._set_pause_btn(False)
+        if getattr(self, "_countdown_left", 0) > 0:     # skip the rest of the countdown
+            self._cancel_typing_timers()
+            self._countdown_left = 0
+            self._schedule(b"typeStep:", 0.12)
+        self._set_status("Typing key by key…")
+        self._set_chip("Key by key", THEME_ACCENT)
+        # One press = one keystroke: step past pause-only steps until the
+        # engine has actually typed (or erased) something.
+        before = self._kb_counter.count
+        for _ in range(64):
+            try:
+                next(self._typing_gen)
+            except StopIteration:
+                self._finish(True)
+                return
+            except Exception:
+                self._finish(False)
+                return
+            self._done_steps += 1
+            if self._kb_counter.count > before:
+                break
+        self._update_progress(self._done_steps, self._total_steps)
+
     def togglePause_(self, sender):
         if self.state is None or self._typing_gen is None:
             return
@@ -3152,6 +3480,7 @@ rm -- "$0"   # self-delete
     def stop_(self, sender):
         if self.state is not None:
             self.state.stop()
+            self._schedule(b"typeStep:", 0.0)
         self._set_status("Stopping…")
 
     def end_(self, sender):
@@ -3185,11 +3514,42 @@ rm -- "$0"   # self-delete
     def recordTypePaste_(self, sender):
         self._record("type_paste", self.type_paste_rec)
 
+    def recordDestruct_(self, sender):
+        self._record("destruct", self.destruct_rec)
+
+    def chordHeld_(self, _):
+        if self._chord_armed:
+            self._chord_armed = False
+            ob = self._onboarding
+            if ob is not None and ob.current() == "destruct":
+                ob.demo_destruct()      # the tour's own page: show it, don't quit
+            else:
+                self.selfDestruct_(None)
+
+    def selfDestruct_(self, sender):
+        """Self-destruct: stop any run, give the keyboard back, wipe everything
+        unsaved (the text box and any saved draft) and quit at once. Saved
+        snippets and settings stay; a downloaded update is not installed."""
+        if self.state is not None:
+            self.state.stop()
+        self._cancel_typing_timers()
+        self._typing_gen = None
+        self._kbd_locked = False
+        self.text_view.setString_("")
+        d = NSUserDefaults.standardUserDefaults()
+        d.removeObjectForKey_("draft_text")
+        d.removeObjectForKey_("ht_resume_tour")
+        d.synchronize()
+        self._relaunching = True        # skip install-on-quit: leave now
+        self._teardown_global_tap()
+        NSApplication.sharedApplication().terminate_(None)
+
     @objc.python_method
     def _bindings(self):
         return {"start_stop": self.start_stop_binding, "pause": self.pause_binding,
                 "stop": self.stop_binding, "lock": self.lock_binding,
-                "type_paste": self.type_paste_binding}
+                "type_paste": self.type_paste_binding,
+                "destruct": self.destruct_binding}
 
     @objc.python_method
     def _record(self, which, button):
@@ -3246,6 +3606,8 @@ rm -- "$0"   # self-delete
                 self.lock_binding = binding
             elif which == "type_paste":
                 self.type_paste_binding = binding
+            elif which == "destruct":
+                self.destruct_binding = binding
             else:
                 self.start_stop_binding = binding
             self._save_binding(which, binding)
