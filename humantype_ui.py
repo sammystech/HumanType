@@ -714,6 +714,9 @@ KEY_F6 = 97
 DND_AS_F6 = ('{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0x10000009B,'
              '"HIDKeyboardModifierMappingDst":0x70000003F}]}')
 
+# Bump when the default shortcuts change and everyone should move to them.
+SHORTCUTS_VERSION = 2
+
 # Bindings that act in every app even when idle, and the modifiers they need.
 # Lock isn't here: a bare lock key (Tab) is fine because it only acts during a
 # run or while locked (see _lock_live), so it types normally the rest of the time.
@@ -1657,6 +1660,14 @@ class AppController(NSObject):
         self._just_relaunched = bool(d.boolForKey_("relaunched_for_perm"))
         if self._just_relaunched:
             d.removeObjectForKey_("relaunched_for_perm")
+        # One-time move to the current default shortcuts (⌘S, `, F6, ⌥⌘V, ⌃⌥⌘):
+        # shortcuts saved by older versions are cleared once, then any the user
+        # records from here on are kept.
+        if d.integerForKey_("ht_shortcuts_version") < SHORTCUTS_VERSION:
+            for name in ("start_stop", "pause", "stop", "lock", "type_paste", "destruct"):
+                d.removeObjectForKey_(name + "_kc")
+                d.removeObjectForKey_(name + "_mods")
+            d.setInteger_forKey_(SHORTCUTS_VERSION, "ht_shortcuts_version")
         self.pause_binding = self._load_binding(d, "pause", ht.DEFAULT_PAUSE_BINDING)
         self.stop_binding = self._load_binding(d, "stop", ht.DEFAULT_STOP_BINDING)
         self.start_stop_binding = self._load_binding(
