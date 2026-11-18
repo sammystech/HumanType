@@ -21,6 +21,7 @@ import ssl
 import subprocess
 import sys
 import threading
+from datetime import datetime
 import time
 import urllib.error
 import urllib.request
@@ -160,6 +161,30 @@ def _version_tuple(v):
         return tuple(int(x) for x in v.split("."))
     except Exception:
         return (0, 0, 0)
+
+
+# Anonymous usage stats ("Help improve HumanType"), opt-in. Collected by the
+# stats service on the NMX PC (stats/server.py), published at this one path.
+STATS_URL = os.environ.get("HUMANTYPE_STATS_URL") or "https://nmx.net/ht/api/stats"
+
+
+def device_info():
+    """What kind of Mac this is: model, chip, RAM, cores, macOS. No serials or IDs."""
+    def sysctl(name):
+        try:
+            return subprocess.run(["/usr/sbin/sysctl", "-n", name], capture_output=True,
+                                  text=True, timeout=3).stdout.strip()
+        except Exception:
+            return ""
+    import platform
+    info = {"app": APP_VERSION, "macos": platform.mac_ver()[0],
+            "model": sysctl("hw.model"), "chip": sysctl("machdep.cpu.brand_string")}
+    try:
+        info["ram_gb"] = round(int(sysctl("hw.memsize")) / 2**30)
+        info["cores"] = int(sysctl("hw.ncpu"))
+    except ValueError:
+        pass
+    return info
 
 
 def fetch_latest_release():
@@ -1104,13 +1129,22 @@ class _CountingKeyboard:
     def __init__(self, kb):
         self.kb = kb
         self.count = 0
+        self.chars = 0          # for the stats: how much was typed, never what
+        self.letters = 0
+        self.backspaces = 0
 
     def type(self, ch):
         self.count += 1
+        self.chars += 1
+        self.letters += ch.isalpha()
         self.kb.type(ch)
 
     def press(self, key):
         self.count += 1
+        if key == ht.Key.backspace:
+            self.backspaces += 1
+        else:
+            self.chars += 1
         self.kb.press(key)
 
     def release(self, key):
@@ -1194,6 +1228,10 @@ class Onboarding(NSObject):
          "Need it gone fast? Hold {destruct} together for a moment: HumanType stops, "
          "wipes the text you haven't saved and quits on the spot. Try it here, it "
          "won't quit."),
+        ("stats", "chart.bar.fill", "Help improve HumanType",
+         "Share anonymous stats: how much you type with HumanType, its speed, which "
+         "features you use and how smoothly it runs on your Mac. Never what you type, your "
+         "name or anything that identifies you. Change it anytime in Settings."),
         ("done", "checkmark", "You're all set",
          "Change the speed, realism and every shortcut in Settings. You can replay "
          "this tour anytime from the HumanType menu in the menu bar."),
@@ -1360,12 +1398,20 @@ class Onboarding(NSObject):
         elif c._practice_run and self.practice_visible():
             self.view.window().makeFirstResponder_(self.practice_tv)
 
-        primary = {"welcome": "Start the tour", "done": "Start using HumanType"}.get(key, "Next")
-        btn = c._glass_button(primary, b"next:", NSMakeRect((W - 240) / 2, 52, 240, 44),
-                              prominent=True, size=15)
+        primary = {"welcome": "Start the tour", "done": "Start using HumanType",
+                   "stats": "Share anonymous stats"}.get(key, "Next")
+        btn = c._glass_button(primary, b"statsYes:" if key == "stats" else b"next:",
+                              NSMakeRect((W - 260) / 2, 52, 260, 44), prominent=True, size=15)
         btn.setTarget_(self)
         self.stage.addSubview_(btn)
         self._primary = btn
+        if key == "stats":
+            no = NSButton.buttonWithTitle_target_action_("No thanks", self, b"statsNo:")
+            no.setBordered_(False)
+            no.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium))
+            no.setContentTintColor_(NSColor.secondaryLabelColor())
+            no.setFrame_(NSMakeRect((W - 160) / 2, 16, 160, 28))
+            self.stage.addSubview_(no)
         if key == "permission":
             self._build_permission(top - 330)
         if key in self.KEY_STEPS:
@@ -1507,6 +1553,14 @@ class Onboarding(NSObject):
     def skip_(self, sender):
         self._close()
 
+    def statsYes_(self, sender):
+        self.ctrl._set_stats_choice(True)
+        self.next_(None)
+
+    def statsNo_(self, sender):
+        self.ctrl._set_stats_choice(False)
+        self.next_(None)
+
     @objc.python_method
     def _leave_step(self):
         if self.current() == "paste":
@@ -1525,6 +1579,7 @@ class Onboarding(NSObject):
     @objc.python_method
     def _close(self):
         c = self.ctrl
+        c._stat({"kind": "feature", "name": "tour_done" if self.current() == "done" else "tour_skipped"})
         if c._practice_run and c.state is not None:
             c.state.stop()
             c._finish(False)
@@ -1651,6 +1706,7 @@ class AppController(NSObject):
         self._practice_run = False  # the tour's run, typing into its practice box
         self._dnd_remapped = False  # moon key currently sending F6 (see DND_AS_F6)
         self._chord_armed = False   # ⌃⌥⌘ held, self-destruct pending (see the tap)
+        self._run_stats = None      # numbers for the current run (see _record_run)
         self._monitor = None
         self._record_button = None  # button currently awaiting a key press
         self._record_which = None   # which binding is being recorded
@@ -1734,6 +1790,10 @@ class AppController(NSObject):
         self._notch = NotchUpdatePanel()
         # Check for updates quietly a few seconds after launch, then periodically.
         self._schedule(b"_checkForUpdates:", 4.0)
+        self._schedule(b"statsLaunch:", 8.0)
+        from Foundation import NSTimer
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            6 * 3600, True, lambda t: self._stats_flush())
         if LicenseManager.is_licensed() or not LICENSING_ENABLED:
             self.showWindow_(None)
             resume = NSUserDefaults.standardUserDefaults().stringForKey_("ht_resume_tour")
@@ -1995,6 +2055,8 @@ rm -- "$0"   # self-delete
         self.lock_menu_item.setTarget_(self)
         menu.addItem_(self.lock_menu_item)
         item("Show Tutorial", b"showTutorial:")
+        self.stats_menu_item = item("Share Anonymous Stats", b"toggleStats:")
+        self.stats_menu_item.setState_(1 if self._stats_choice() == "on" else 0)
         menu.addItem_(NSMenuItem.separatorItem())
         if LICENSING_ENABLED:
             item("Enter License Key", b"showLicense:")
@@ -2451,6 +2513,8 @@ rm -- "$0"   # self-delete
         if not cal:
             return
         d = NSUserDefaults.standardUserDefaults()
+        if not d.dictionaryForKey_("ht_calibration") or len(self._calib_events) == CALIBRATE_KEYS:
+            self._stat({"kind": "feature", "name": "calibrate"})
         d.setObject_forKey_(cal, "ht_calibration")
         self._realism_name = "You"
         d.setObject_forKey_("You", "ht_realism")
@@ -2556,6 +2620,14 @@ rm -- "$0"   # self-delete
             c, row(h, 5), "Self-destruct: wipe & quit (hold)", self.destruct_binding,
             b"recordDestruct:")
 
+        st.addSubview_(self._label("Share anonymous stats", NSMakeRect(W - M - 200, TOP - 58, 150, 16),
+                                   size=11.5, gray=True, align=NSTextAlignmentRight))
+        self._st_stats = NSSwitch.alloc().initWithFrame_(NSMakeRect(W - M - 42, TOP - 60, 42, 20))
+        self._st_stats.setControlSize_(NSControlSizeSmall)
+        self._st_stats.setState_(1 if self._stats_choice() == "on" else 0)
+        self._st_stats.setTarget_(self)
+        self._st_stats.setAction_(b"statsSwitched:")
+        st.addSubview_(self._st_stats)
         self._version_lbl = self._label(
             f"HumanType {APP_VERSION}", NSMakeRect(W - M - 200, TOP - 30, 200, 16), size=11,
             dim=True, align=NSTextAlignmentRight)
@@ -2750,6 +2822,7 @@ rm -- "$0"   # self-delete
         if not text:
             self._set_status("Nothing to save — paste some text first.")
             return
+        self._stat({"kind": "feature", "name": "snippet_saved"})
         snips = self._load_snippets()
         # Use first line as title, truncated
         title = text.split("\n")[0][:50] or "Snippet"
@@ -2978,6 +3051,8 @@ rm -- "$0"   # self-delete
         if self._strip_fmt:
             text = " ".join(text.split())
         self._run_typing(text, 0)
+        self._run_stats["mode"] = "clipboard"
+        self._stat({"kind": "feature", "name": "type_clipboard"})
         self._from_window = False
         self._set_status("Typing what you pasted…")
 
@@ -2995,6 +3070,9 @@ rm -- "$0"   # self-delete
         # the main run loop (countdownTick: → typeStep:) — TSM requires main thread.
         self.typist = ht.Typist(
             self._kb_counter, self.state, 60.0 / (wpm * 5.0), mistake_rate)
+        self._run_stats = {"mode": "practice" if self._practice_run else "normal",
+                           "wpm_set": wpm, "realism": self._realism_name, "lags": [],
+                           "first": None, "key_by_key": False, "locked": False}
         cal = self._calibration() if self._realism_name == "You" else None
         if cal:                         # your measured rhythm, not a preset
             self.typist.variation = cal["variation"]
@@ -3036,6 +3114,8 @@ rm -- "$0"   # self-delete
         # firing even while a menu is open or the window is being dragged. Every
         # keystroke must post from the main thread (pynput's calls hit Text
         # Services Manager APIs that crash off-main), and this is what guarantees it.
+        if selector == b"typeStep:":
+            self._step_due = time.monotonic() + max(0.0, delay)
         self.performSelector_withObject_afterDelay_inModes_(
             selector, None, float(max(0.0, delay)), [NSRunLoopCommonModes])
 
@@ -3371,6 +3451,13 @@ rm -- "$0"   # self-delete
         self.syncLockUI_(None)
 
     @objc.python_method
+    def _note_lock(self):
+        if self._kbd_locked:
+            self._stat({"kind": "feature", "name": "lock"})
+            if self._run_stats is not None:
+                self._run_stats["locked"] = True
+
+    @objc.python_method
     def _mash_hold_on_unlock(self):
         """Key-by-key mode: unlocking pauses the run in the same instant, so no
         letter types itself before your keyboard is back."""
@@ -3394,6 +3481,7 @@ rm -- "$0"   # self-delete
                 self.status_item.button().setImage_(img)
         except Exception:
             pass
+        self._note_lock()
         if self._kbd_locked:
             self._set_chip("Locked", NSColor.systemOrangeColor())
         else:
@@ -3459,6 +3547,12 @@ rm -- "$0"   # self-delete
             return
         if self._typing_gen is None:
             return
+        due, self._step_due = getattr(self, "_step_due", None), None
+        if due is not None and self._run_stats is not None:
+            # How late this tick fired: how smoothly HumanType keeps time on this Mac.
+            lags = self._run_stats["lags"]
+            if len(lags) < 20000:
+                lags.append(max(0.0, (time.monotonic() - due) * 1000))
         if self.state.stopped:
             self._finish(False)
             return
@@ -3490,6 +3584,8 @@ rm -- "$0"   # self-delete
             self._finish(False)
             return
         self._done_steps += 1
+        if self._run_stats is not None and self._run_stats["first"] is None:
+            self._run_stats["first"] = time.monotonic()
         # Update progress bar every ~10 steps so it stays smooth without overhead
         if self._done_steps % 10 == 0:
             self._update_progress(self._done_steps, self._total_steps)
@@ -3505,6 +3601,7 @@ rm -- "$0"   # self-delete
         # countdown second or injecting a phantom keystroke into the new run.
         self._cancel_typing_timers()
         self._typing_gen = None
+        self._record_run(finished)
         self.typist = None
         self._target_app = None
         self._holding = False
@@ -3549,6 +3646,10 @@ rm -- "$0"   # self-delete
             self._countdown_left = 0
             self._schedule(b"typeStep:", 0.12)
         self._set_status("Typing key by key…")
+        if self._run_stats is not None:
+            self._run_stats["key_by_key"] = True
+            if self._run_stats["first"] is None:
+                self._run_stats["first"] = time.monotonic()
         self._set_chip("Key by key", THEME_ACCENT)
         # One press = one keystroke: step past pause-only steps until the
         # engine has actually typed (or erased) something.
@@ -3632,6 +3733,151 @@ rm -- "$0"   # self-delete
             else:
                 self.selfDestruct_(None)
 
+    # ── Anonymous stats ("Help improve HumanType") ──────────────────────
+
+    @objc.python_method
+    def _record_run(self, finished):
+        """One run's numbers, never its text: how much was typed, how fast, how
+        many typos, and how closely the typing kept time on this Mac."""
+        rs, self._run_stats = self._run_stats, None
+        kb = getattr(self, "_kb_counter", None)
+        if rs is None or kb is None or kb.chars == 0:
+            return
+        seconds = time.monotonic() - rs["first"] if rs["first"] else 0.0
+        lags = sorted(rs["lags"])
+        event = {"kind": "run", "mode": rs["mode"], "realism": rs["realism"],
+                 "chars": kb.chars, "letters": kb.letters, "typos": kb.backspaces,
+                 "keypresses": kb.count, "seconds": round(seconds, 1), "wpm_set": rs["wpm_set"],
+                 "finished": bool(finished), "key_by_key": rs["key_by_key"], "locked": rs["locked"]}
+        if seconds >= 1:
+            event["wpm_real"] = round(kb.chars / 5 / (seconds / 60), 1)
+        if lags:
+            event["lag_avg"] = round(sum(lags) / len(lags), 2)
+            event["lag_p95"] = round(lags[int(len(lags) * 0.95) - 1 if len(lags) > 1 else 0], 2)
+            event["on_time"] = round(100 * sum(1 for x in lags if x <= 15) / len(lags), 1)
+        self._stat(event)
+        self._stats_flush()
+
+    @objc.python_method
+    def _stats_choice(self):
+        return str(NSUserDefaults.standardUserDefaults().stringForKey_("ht_stats_choice") or "")
+
+    @objc.python_method
+    def _stat(self, event):
+        """Queue one event, only if the user said yes. Sent in small batches."""
+        if self._stats_choice() != "on":
+            return
+        now = datetime.now()
+        event = dict(event, day=now.date().isoformat(), hour=now.hour)
+        d = NSUserDefaults.standardUserDefaults()
+        try:
+            queue = json.loads(d.stringForKey_("ht_stats_queue") or "[]")
+        except ValueError:
+            queue = []
+        queue = (queue + [event])[-300:]
+        d.setObject_forKey_(json.dumps(queue), "ht_stats_queue")
+        if len(queue) >= 25:
+            self._stats_flush()
+
+    @objc.python_method
+    def _stats_flush(self):
+        if self._stats_choice() != "on" or getattr(self, "_stats_sending", False):
+            return
+        d = NSUserDefaults.standardUserDefaults()
+        try:
+            queue = json.loads(d.stringForKey_("ht_stats_queue") or "[]")
+        except ValueError:
+            queue = []
+        if not queue:
+            return
+        install = d.stringForKey_("ht_stats_install")
+        if not install:
+            import uuid
+            install = str(uuid.uuid4())     # random, made only for this
+            d.setObject_forKey_(install, "ht_stats_install")
+        if getattr(self, "_device", None) is None:
+            self._device = device_info()
+        body = json.dumps(dict(self._device, install=str(install), events=queue)).encode()
+        self._stats_sending = True
+        sent = len(queue)
+
+        def work():
+            ok = False
+            try:
+                req = urllib.request.Request(STATS_URL, data=body, headers={
+                    "Content-Type": "application/json", "User-Agent": f"HumanType/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=10, context=TLS) as resp:
+                    ok = resp.status == 200
+            except Exception:
+                pass
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"statsSent:", sent if ok else 0, False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def statsSent_(self, sent):
+        self._stats_sending = False
+        if not sent:
+            # Offline or the server's busy: try again in a minute, not in 6 hours.
+            if not getattr(self, "_stats_retry", False):
+                self._stats_retry = True
+                def retry():
+                    self._stats_retry = False
+                    self._stats_flush()
+                NotchUpdatePanel._after(60.0, retry)
+            return
+        d = NSUserDefaults.standardUserDefaults()
+        try:
+            queue = json.loads(d.stringForKey_("ht_stats_queue") or "[]")
+        except ValueError:
+            queue = []
+        rest = queue[int(sent):]
+        d.setObject_forKey_(json.dumps(rest), "ht_stats_queue")
+        if rest:                        # more came in while this batch was sending
+            self._stats_flush()
+
+    @objc.python_method
+    def _set_stats_choice(self, on):
+        d = NSUserDefaults.standardUserDefaults()
+        d.setObject_forKey_("on" if on else "off", "ht_stats_choice")
+        if not on:
+            d.removeObjectForKey_("ht_stats_queue")
+        else:
+            self._stat({"kind": "feature", "name": "stats_on"})
+            self._stat({"kind": "open"})
+            self._stats_flush()
+        if getattr(self, "_st_stats", None) is not None:
+            self._st_stats.setState_(1 if on else 0)
+        if getattr(self, "stats_menu_item", None) is not None:
+            self.stats_menu_item.setState_(1 if on else 0)
+
+    def toggleStats_(self, sender):
+        self._set_stats_choice(self._stats_choice() != "on")
+
+    def statsSwitched_(self, sender):
+        self._set_stats_choice(bool(sender.state()))
+
+    def statsLaunch_(self, _):
+        """A few seconds after launch: a daily 'open', send what's queued, and
+        ask once (outside the tour) if the user hasn't chosen yet."""
+        d = NSUserDefaults.standardUserDefaults()
+        today = datetime.now().date().isoformat()
+        if self._stats_choice() == "on" and d.stringForKey_("ht_stats_last_open") != today:
+            d.setObject_forKey_(today, "ht_stats_last_open")
+            self._stat({"kind": "open"})
+        self._stats_flush()
+        if not self._stats_choice() and self._onboarding is None:
+            from AppKit import NSAlert
+            a = NSAlert.alloc().init()
+            a.setMessageText_("Help improve HumanType?")
+            a.setInformativeText_(
+                "Share anonymous stats: how much you type with HumanType, its speed, which "
+                "features you use and how smoothly it runs on your Mac.\n\nNever what you type, "
+                "your name or anything that identifies you. Change it anytime in Settings.")
+            a.addButtonWithTitle_("Share stats")
+            a.addButtonWithTitle_("No thanks")
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            self._set_stats_choice(a.runModal() == 1000)
+
     def selfDestruct_(self, sender):
         """Self-destruct: stop any run, give the keyboard back, wipe everything
         unsaved (the text box and any saved draft) and quit at once. Saved
@@ -3642,6 +3888,7 @@ rm -- "$0"   # self-delete
         self._typing_gen = None
         self._kbd_locked = False
         self.text_view.setString_("")
+        self._stat({"kind": "feature", "name": "self_destruct"})   # sent next launch
         d = NSUserDefaults.standardUserDefaults()
         d.removeObjectForKey_("draft_text")
         d.removeObjectForKey_("ht_resume_tour")

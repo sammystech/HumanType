@@ -126,7 +126,10 @@ class T(NSObject):
         self.wait(b"m3:", 2.9)
     def m3_(self, _):
         c, ob = self.c, self.ob
-        check("-> Done step", ob.current() == "done", ob.current())
+        check("-> Help improve (stats) step", ob.current() == "stats", ob.current())
+        ob.statsNo_(None)
+        check("No thanks → stats off, -> Done step", c._stats_choice() == "off" and ob.current() == "done", ob.current())
+        NSUserDefaults.standardUserDefaults().removeObjectForKey_("ht_stats_choice")
         ob.next_(None)
         check("tour closed, lock off", c._onboarding is None and not c._kbd_locked)
         self.wait(b"n:", 0.6)
